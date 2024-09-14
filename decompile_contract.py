@@ -4,12 +4,12 @@ import logging
 import sys
 
 def setup_logging():
-    """Set up the logging configuration."""
+    """Set up logging configuration with INFO level and a specific format."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def decompile_bytecode(bytecode):
     """
-    Decompile the given EVM bytecode into human-readable instructions.
+    Decompile EVM bytecode into human-readable instructions.
 
     Args:
         bytecode (str): The EVM bytecode to decompile.
@@ -21,29 +21,31 @@ def decompile_bytecode(bytecode):
         instructions = evmdasm.EvmBytecode(bytecode).disassemble()
         return instructions
     except Exception as e:
-        logging.error(f"Error decompiling bytecode: {e}")
+        logging.error(f"Failed to decompile bytecode: {e}")
         return None
 
 def read_bytecode_from_file(file_path):
     """
-    Read bytecode from a specified file.
+    Read EVM bytecode from a file.
 
     Args:
-        file_path (str): Path to the file containing the EVM bytecode.
+        file_path (str): Path to the file containing the bytecode.
 
     Returns:
-        str: The EVM bytecode as a string.
+        str: The EVM bytecode as a string, or None if an error occurs.
     """
     try:
         with open(file_path, 'r') as file:
             return file.read().strip()
-    except Exception as e:
+    except FileNotFoundError:
+        logging.error(f"File not found: '{file_path}'")
+    except IOError as e:
         logging.error(f"Error reading file '{file_path}': {e}")
-        return None
+    return None
 
 def main(bytecode):
     """
-    Main function to handle the decompilation of the EVM bytecode.
+    Main function to handle the decompilation process of the provided EVM bytecode.
 
     Args:
         bytecode (str): The EVM bytecode to decompile.
@@ -54,23 +56,19 @@ def main(bytecode):
         for instruction in decompiled_code:
             print(instruction)
     else:
-        logging.error("Failed to decompile the contract.")
+        logging.error("Decompilation failed.")
 
 if __name__ == "__main__":
     setup_logging()
 
-    parser = argparse.ArgumentParser(description="Decompile EVM bytecode.")
+    parser = argparse.ArgumentParser(description="EVM Bytecode Decompiler")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--bytecode', type=str, help="The EVM bytecode as a string.")
+    group.add_argument('--bytecode', type=str, help="EVM bytecode as a string.")
     group.add_argument('--file', type=str, help="Path to a file containing the EVM bytecode.")
     
     args = parser.parse_args()
 
-    bytecode = None
-    if args.bytecode:
-        bytecode = args.bytecode
-    elif args.file:
-        bytecode = read_bytecode_from_file(args.file)
+    bytecode = args.bytecode if args.bytecode else read_bytecode_from_file(args.file)
 
     if not bytecode:
         logging.error("No valid bytecode provided. Exiting.")
