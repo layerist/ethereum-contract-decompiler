@@ -3,9 +3,9 @@ import argparse
 import logging
 import sys
 
-def setup_logging():
-    """Configure logging with INFO level and a specific format for consistency."""
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+def setup_logging(log_level=logging.INFO):
+    """Configure logging with a specified level and a consistent format."""
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def decompile_bytecode(bytecode):
     """
@@ -21,7 +21,7 @@ def decompile_bytecode(bytecode):
         instructions = evmdasm.EvmBytecode(bytecode).disassemble()
         return instructions
     except Exception as e:
-        logging.error(f"Decompilation error: {e}")
+        logging.exception("Decompilation error")
         return None
 
 def read_bytecode_from_file(file_path):
@@ -40,13 +40,23 @@ def read_bytecode_from_file(file_path):
             if not bytecode:
                 raise ValueError("The file is empty.")
             return bytecode
-    except FileNotFoundError:
-        logging.error(f"File not found: '{file_path}'")
-    except IOError as e:
+    except (FileNotFoundError, IOError, ValueError) as e:
         logging.error(f"Error reading file '{file_path}': {e}")
-    except ValueError as e:
-        logging.error(f"Invalid content in '{file_path}': {e}")
-    return None
+        return None
+
+def output_decompiled_code(decompiled_code):
+    """
+    Output the decompiled EVM instructions.
+    
+    Args:
+        decompiled_code (list): A list of decompiled instructions.
+    """
+    if decompiled_code:
+        logging.info("Decompiled Contract Code:")
+        for instruction in decompiled_code:
+            print(instruction)
+    else:
+        logging.error("No instructions to display.")
 
 def main(bytecode):
     """
@@ -56,12 +66,7 @@ def main(bytecode):
         bytecode (str): EVM bytecode as a string.
     """
     decompiled_code = decompile_bytecode(bytecode)
-    if decompiled_code:
-        logging.info("Decompiled Contract Code:")
-        for instruction in decompiled_code:
-            print(instruction)
-    else:
-        logging.error("Decompilation failed.")
+    output_decompiled_code(decompiled_code)
 
 if __name__ == "__main__":
     setup_logging()
