@@ -1,14 +1,31 @@
 import evmdasm
 import argparse
 import logging
+import re
 from typing import List, Optional
 
 
 def setup_logging(level: int = logging.INFO) -> None:
     """
     Configure logging with the specified level and format.
+
+    Args:
+        level (int): Logging level. Defaults to logging.INFO.
     """
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def is_valid_bytecode(bytecode: str) -> bool:
+    """
+    Validate the EVM bytecode format.
+
+    Args:
+        bytecode (str): Raw EVM bytecode as a hexadecimal string.
+
+    Returns:
+        bool: True if valid, False otherwise.
+    """
+    return bool(re.fullmatch(r"0x[0-9a-fA-F]+", bytecode))
 
 
 def decompile_bytecode(bytecode: str) -> Optional[List[str]]:
@@ -22,9 +39,10 @@ def decompile_bytecode(bytecode: str) -> Optional[List[str]]:
         Optional[List[str]]: Decompiled instructions, or None if decompilation fails.
     """
     try:
+        logging.debug("Attempting to decompile bytecode...")
         return evmdasm.EvmBytecode(bytecode).disassemble()
     except Exception as e:
-        logging.exception("Failed to decompile the provided bytecode. Ensure it is valid.")
+        logging.exception("Decompilation failed. Ensure the bytecode is valid.")
         return None
 
 
@@ -43,13 +61,16 @@ def read_bytecode_from_file(file_path: str) -> Optional[str]:
             bytecode = file.read().strip()
             if not bytecode:
                 raise ValueError("The file is empty or contains only whitespace.")
+            if not is_valid_bytecode(bytecode):
+                raise ValueError("Invalid bytecode format in the file.")
+            logging.debug("Successfully read and validated bytecode from file.")
             return bytecode
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}")
     except IOError as e:
         logging.error(f"Error reading file '{file_path}': {e}")
     except ValueError as e:
-        logging.error(f"Invalid file content: {e}")
+        logging.error(f"Validation error: {e}")
     return None
 
 
@@ -75,6 +96,10 @@ def main(bytecode: str) -> None:
     Args:
         bytecode (str): EVM bytecode string to be decompiled.
     """
+    if not is_valid_bytecode(bytecode):
+        logging.error("Invalid bytecode format. Ensure it starts with '0x' and contains only hexadecimal characters.")
+        exit(2)
+
     logging.info("Starting the decompilation process...")
     instructions = decompile_bytecode(bytecode)
     display_decompiled_code(instructions)
