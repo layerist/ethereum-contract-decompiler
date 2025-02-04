@@ -25,7 +25,7 @@ def is_valid_bytecode(bytecode: str) -> bool:
     Returns:
         bool: True if valid, False otherwise.
     """
-    return bool(re.fullmatch(r"0x[0-9a-fA-F]+", bytecode))
+    return bool(re.fullmatch(r"^0x[0-9a-fA-F]+$", bytecode))
 
 
 def decompile_bytecode(bytecode: str) -> Optional[List[str]]:
@@ -40,7 +40,8 @@ def decompile_bytecode(bytecode: str) -> Optional[List[str]]:
     """
     try:
         logging.debug("Attempting to decompile bytecode...")
-        return evmdasm.EvmBytecode(bytecode).disassemble()
+        bytecode_obj = evmdasm.EvmBytecode(bytecode)
+        return bytecode_obj.disassemble()
     except Exception as e:
         logging.exception("Decompilation failed. Ensure the bytecode is valid.")
         return None
@@ -63,7 +64,7 @@ def read_bytecode_from_file(file_path: str) -> Optional[str]:
                 raise ValueError("The file is empty or contains only whitespace.")
             if not is_valid_bytecode(bytecode):
                 raise ValueError("Invalid bytecode format in the file.")
-            logging.debug("Successfully read and validated bytecode from file.")
+            logging.debug(f"Successfully read and validated bytecode from {file_path}.")
             return bytecode
     except FileNotFoundError:
         logging.error(f"File not found: {file_path}")
