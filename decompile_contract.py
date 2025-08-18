@@ -3,7 +3,7 @@
 EVM Bytecode Disassembler
 --------------------------
 Disassembles Ethereum Virtual Machine (EVM) bytecode into human-readable instructions.
-Supports input via raw bytecode or a file.
+Supports input via raw bytecode, file, or stdin.
 
 Usage examples:
     python disassembler.py --bytecode 0x6001600101
@@ -28,7 +28,7 @@ EXIT_DISASSEMBLY_ERROR = 4
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configure the logging format and level."""
+    """Configure logging format and level."""
     logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -43,7 +43,9 @@ def load_bytecode_from_file(file_path: Path) -> Optional[str]:
     Returns the bytecode string if valid, otherwise None.
     """
     try:
-        content = file_path.read_text(encoding="utf-8").strip()
+        content = file_path.read_text(encoding="utf-8")
+        # Normalize whitespace, join lines
+        content = re.sub(r"\s+", "", content)
         if not content:
             logging.error("File is empty: %s", file_path)
             return None
@@ -58,10 +60,15 @@ def load_bytecode_from_file(file_path: Path) -> Optional[str]:
     return None
 
 
-def disassemble_bytecode(bytecode: str) -> List[str]:
+def disassemble_bytecode(bytecode: str, pretty: bool = False) -> List[str]:
     """Disassemble EVM bytecode into human-readable instructions."""
     try:
         instructions = evmdasm.EvmBytecode(bytecode).disassemble()
+        if pretty:
+            # Align opcodes for nicer output
+            max_len = max(len(instr.name) for instr in instructions) if instructions else 0
+            return [f"{instr.pc:04d}: {instr.name.ljust(max_len)} {instr.operand or ''}".rstrip()
+                    for instr in instructions]
         return [str(instr) for instr in instructions]
     except Exception as e:
         logging.exception("Failed to disassemble bytecode: %s", e)
@@ -86,7 +93,7 @@ def output_instructions(instructions: List[str], output_file: Optional[Path]) ->
             print(instr)
 
 
-def run_disassembler(bytecode: str, output_file: Optional[Path]) -> int:
+def run_disassembler(bytecode: str, output_file: Optional[Path], pretty: bool) -> int:
     """
     Validate, disassemble, and output bytecode.
     Returns an exit code.
@@ -95,7 +102,7 @@ def run_disassembler(bytecode: str, output_file: Optional[Path]) -> int:
         logging.error("Invalid bytecode. Must start with '0x' and contain only hex characters.")
         return EXIT_INVALID_BYTECODE
 
-    instructions = disassemble_bytecode(bytecode)
+    instructions = disassemble_bytecode(bytecode, pretty=pretty)
     if not instructions:
         return EXIT_DISASSEMBLY_ERROR
 
@@ -113,6 +120,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--output", type=Path, help="Output file for disassembled instructions")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level logging")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print disassembly with aligned output")
 
     return parser.parse_args()
 
@@ -128,16 +136,16 @@ def main() -> int:
         bytecode = load_bytecode_from_file(args.file)
 
     # If neither argument was provided, try reading from stdin
-    if not bytecode and sys.stdin.isatty() is False:
-        stdin_data = sys.stdin.read().strip()
-        if is_valid_bytecode(stdin_data):
+    if not bytecode:
+        stdin_data = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+        if stdin_data and is_valid_bytecode(stdin_data):
             bytecode = stdin_data
 
     if not bytecode:
         logging.error("No valid bytecode provided.")
         return EXIT_READ_ERROR
 
-    return run_disassembler(bytecode, args.output)
+    return run_disassembler(bytecode, args.output, args.pretty)
 
 
 if __name__ == "__main__":
