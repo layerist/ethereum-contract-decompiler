@@ -33,8 +33,16 @@ def setup_logging(level: int = logging.INFO) -> None:
 
 
 def is_valid_bytecode(bytecode: str) -> bool:
-    """Return True if the string looks like valid EVM bytecode."""
-    return bool(re.fullmatch(r"0x[0-9a-fA-F]+", bytecode))
+    """Return True if the string looks like valid EVM bytecode (with or without 0x)."""
+    return bool(re.fullmatch(r"(0x)?[0-9a-fA-F]+", bytecode))
+
+
+def normalize_bytecode(bytecode: str) -> str:
+    """Ensure bytecode has 0x prefix and no whitespace."""
+    bc = bytecode.strip().lower()
+    if not bc.startswith("0x"):
+        bc = "0x" + bc
+    return bc
 
 
 def load_bytecode_from_file(file_path: Path) -> Optional[str]:
@@ -44,15 +52,14 @@ def load_bytecode_from_file(file_path: Path) -> Optional[str]:
     """
     try:
         content = file_path.read_text(encoding="utf-8")
-        # Normalize whitespace, join lines
-        content = re.sub(r"\s+", "", content)
+        content = re.sub(r"\s+", "", content)  # normalize whitespace
         if not content:
             logging.error("File is empty: %s", file_path)
             return None
         if not is_valid_bytecode(content):
             logging.error("Invalid bytecode format in file: %s", file_path)
             return None
-        return content
+        return normalize_bytecode(content)
     except FileNotFoundError:
         logging.error("File not found: %s", file_path)
     except OSError as e:
@@ -64,11 +71,15 @@ def disassemble_bytecode(bytecode: str, pretty: bool = False) -> List[str]:
     """Disassemble EVM bytecode into human-readable instructions."""
     try:
         instructions = evmdasm.EvmBytecode(bytecode).disassemble()
+        if not instructions:
+            logging.warning("No instructions found in bytecode.")
+            return []
         if pretty:
-            # Align opcodes for nicer output
-            max_len = max(len(instr.name) for instr in instructions) if instructions else 0
-            return [f"{instr.pc:04d}: {instr.name.ljust(max_len)} {instr.operand or ''}".rstrip()
-                    for instr in instructions]
+            max_len = max(len(instr.name) for instr in instructions)
+            return [
+                f"{instr.pc:04d}: {instr.name.ljust(max_len)} {instr.operand or ''}".rstrip()
+                for instr in instructions
+            ]
         return [str(instr) for instr in instructions]
     except Exception as e:
         logging.exception("Failed to disassemble bytecode: %s", e)
@@ -81,6 +92,8 @@ def output_instructions(instructions: List[str], output_file: Optional[Path]) ->
         logging.warning("No instructions to output.")
         return
 
+    header = f"Disassembled EVM Instructions ({len(instructions)} ops):"
+
     if output_file:
         try:
             output_file.write_text("\n".join(instructions), encoding="utf-8")
@@ -88,20 +101,18 @@ def output_instructions(instructions: List[str], output_file: Optional[Path]) ->
         except OSError as e:
             logging.error("Failed to write to file %s: %s", output_file, e)
     else:
-        print("\nDisassembled EVM Instructions:\n")
+        print("\n" + header + "\n" + "-" * len(header))
         for instr in instructions:
             print(instr)
 
 
 def run_disassembler(bytecode: str, output_file: Optional[Path], pretty: bool) -> int:
-    """
-    Validate, disassemble, and output bytecode.
-    Returns an exit code.
-    """
+    """Validate, disassemble, and output bytecode. Returns an exit code."""
     if not is_valid_bytecode(bytecode):
-        logging.error("Invalid bytecode. Must start with '0x' and contain only hex characters.")
+        logging.error("Invalid bytecode. Must contain only hex characters, optional '0x' prefix.")
         return EXIT_INVALID_BYTECODE
 
+    bytecode = normalize_bytecode(bytecode)
     instructions = disassemble_bytecode(bytecode, pretty=pretty)
     if not instructions:
         return EXIT_DISASSEMBLY_ERROR
@@ -113,9 +124,10 @@ def run_disassembler(bytecode: str, output_file: Optional[Path], pretty: bool) -
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="EVM Bytecode Disassembler")
+    parser.add_argument("--version", action="version", version="EVM Disassembler 1.1")
 
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--bytecode", type=str, help="Raw EVM bytecode string (must start with 0x)")
+    group.add_argument("--bytecode", type=str, help="Raw EVM bytecode string")
     group.add_argument("--file", type=Path, help="Path to a file containing EVM bytecode")
 
     parser.add_argument("--output", type=Path, help="Output file for disassembled instructions")
@@ -135,11 +147,17 @@ def main() -> int:
     if args.file:
         bytecode = load_bytecode_from_file(args.file)
 
-    # If neither argument was provided, try reading from stdin
     if not bytecode:
         stdin_data = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
-        if stdin_data and is_valid_bytecode(stdin_data):
-            bytecode = stdin_data
+        if stdin_data:
+            # Support multiple inputs separated by whitespace/newlines
+            parts = re.split(r"\s+", stdin_data)
+            valid_parts = [normalize_bytecode(p) for p in parts if is_valid_bytecode(p)]
+            if len(valid_parts) == 1:
+                bytecode = valid_parts[0]
+            elif len(valid_parts) > 1:
+                logging.error("Multiple bytecode sequences provided via stdin. Use one at a time.")
+                return EXIT_READ_ERROR
 
     if not bytecode:
         logging.error("No valid bytecode provided.")
