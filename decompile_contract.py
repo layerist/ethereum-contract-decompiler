@@ -5,7 +5,7 @@ EVM Bytecode Disassembler
 Disassembles Ethereum Virtual Machine (EVM) bytecode into human-readable instructions.
 Supports input via raw bytecode, file, or stdin.
 
-Usage examples:
+Examples:
     python disassembler.py --bytecode 0x6001600101
     python disassembler.py --file bytecode.txt --output output.txt
     cat bytecode.txt | python disassembler.py --stdin
@@ -17,7 +17,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import evmdasm
 
@@ -50,10 +50,7 @@ def normalize_bytecode(bytecode: str) -> str:
 
 
 def load_bytecode_from_file(file_path: Path) -> Optional[str]:
-    """
-    Load and validate EVM bytecode from a file.
-    Returns the bytecode string if valid, otherwise None.
-    """
+    """Load and validate EVM bytecode from a file."""
     try:
         content = file_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -63,7 +60,7 @@ def load_bytecode_from_file(file_path: Path) -> Optional[str]:
         logging.error("Could not read file %s: %s", file_path, e)
         return None
 
-    content = re.sub(r"\s+", "", content)  # remove whitespace
+    content = re.sub(r"\s+", "", content)  # strip whitespace/newlines
     if not content:
         logging.error("File is empty: %s", file_path)
         return None
@@ -75,8 +72,10 @@ def load_bytecode_from_file(file_path: Path) -> Optional[str]:
     return normalize_bytecode(content)
 
 
-def disassemble_bytecode(bytecode: str, pretty: bool = False, json_out: bool = False) -> List[str]:
-    """Disassemble EVM bytecode into human-readable instructions."""
+def disassemble_bytecode(
+    bytecode: str, pretty: bool = False, json_out: bool = False
+) -> Union[List[str], List[dict]]:
+    """Disassemble EVM bytecode into instructions."""
     try:
         instructions = evmdasm.EvmBytecode(bytecode).disassemble()
         if not instructions:
@@ -107,7 +106,9 @@ def disassemble_bytecode(bytecode: str, pretty: bool = False, json_out: bool = F
         return []
 
 
-def output_instructions(instructions, output_file: Optional[Path], json_out: bool) -> int:
+def output_instructions(
+    instructions: Union[List[str], List[dict]], output_file: Optional[Path], json_out: bool
+) -> int:
     """Print or write disassembled instructions."""
     if not instructions:
         logging.warning("No instructions to output.")
@@ -118,7 +119,7 @@ def output_instructions(instructions, output_file: Optional[Path], json_out: boo
     else:
         header = f"Disassembled EVM Instructions ({len(instructions)} ops):"
         output_data = "\n".join(
-            [header, "-" * len(header), *instructions]
+            [header, "-" * len(header), *instructions]  # type: ignore
         )
 
     if output_file:
@@ -134,8 +135,10 @@ def output_instructions(instructions, output_file: Optional[Path], json_out: boo
     return EXIT_SUCCESS
 
 
-def run_disassembler(bytecode: str, output_file: Optional[Path], pretty: bool, json_out: bool) -> int:
-    """Validate, disassemble, and output bytecode. Returns an exit code."""
+def run_disassembler(
+    bytecode: str, output_file: Optional[Path], pretty: bool, json_out: bool
+) -> int:
+    """Validate, disassemble, and output bytecode. Returns exit code."""
     if not is_valid_bytecode(bytecode):
         logging.error("Invalid bytecode. Must contain only hex characters, optional '0x' prefix.")
         return EXIT_INVALID_BYTECODE
@@ -150,17 +153,20 @@ def run_disassembler(bytecode: str, output_file: Optional[Path], pretty: bool, j
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(description="EVM Bytecode Disassembler")
-    parser.add_argument("--version", action="version", version="EVM Disassembler 1.2")
+    parser = argparse.ArgumentParser(
+        description="EVM Bytecode Disassembler",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--version", action="version", version="EVM Disassembler 1.3")
 
-    group = parser.add_mutually_exclusive_group()
+    group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--bytecode", type=str, help="Raw EVM bytecode string")
     group.add_argument("--file", type=Path, help="Path to a file containing EVM bytecode")
     group.add_argument("--stdin", action="store_true", help="Read EVM bytecode from stdin")
 
     parser.add_argument("--output", type=Path, help="Output file for disassembled instructions")
     parser.add_argument("--debug", action="store_true", help="Enable debug-level logging")
-    parser.add_argument("--pretty", action="store_true", help="Pretty-print disassembly with aligned output")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print aligned output")
     parser.add_argument("--json", action="store_true", help="Output instructions in JSON format")
 
     return parser.parse_args()
@@ -170,6 +176,7 @@ def read_from_stdin() -> Optional[str]:
     """Read and validate bytecode from stdin."""
     stdin_data = sys.stdin.read().strip()
     if not stdin_data:
+        logging.error("No bytecode provided via stdin.")
         return None
 
     parts = re.split(r"\s+", stdin_data)
@@ -182,6 +189,7 @@ def read_from_stdin() -> Optional[str]:
         logging.error("Multiple bytecode sequences provided via stdin. Use one at a time.")
         return None
 
+    logging.error("No valid bytecode found in stdin input.")
     return None
 
 
