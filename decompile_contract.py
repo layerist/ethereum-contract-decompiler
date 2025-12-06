@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Enhanced EVM Bytecode Disassembler
------------------------------------
+Enhanced EVM Bytecode Disassembler (Improved)
+----------------------------------------------
 A safer, cleaner, and more feature-complete utility for disassembling Ethereum
 Virtual Machine (EVM) bytecode using the `evmdasm` library.
 
-Features:
-    • Read bytecode from argument, file, or stdin.
-    • Pretty / aligned output.
-    • JSON output mode.
-    • Opcode usage summary.
-    • Metadata auto-stripping.
-    • Strict mode for opcode validation.
-
-Usage:
-    python disassembler.py --bytecode 0x6001600101
-    python disassembler.py --file bytecode.txt --output result.txt
-    cat bytecode.txt | python disassembler.py --stdin --pretty
+New improvements:
+    • Improved metadata stripping.
+    • Consistent error handling.
+    • More defensive bytecode parsing.
+    • Optional metadata stripping (--no-metadata).
+    • Clearer structure and naming.
+    • Stronger pretty-printing alignment.
+    • Enhanced strict mode checking.
 """
 
 import argparse
@@ -26,9 +22,10 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 import evmdasm
+
 
 # Exit codes
 EXIT_SUCCESS = 0
@@ -38,256 +35,263 @@ EXIT_DISASSEMBLY_ERROR = 4
 EXIT_WRITE_ERROR = 5
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
 # Logging
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
 
 def setup_logging(level: int = logging.INFO) -> None:
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%H:%M:%S",
+        datefmt="%H:%M:%S"
     )
 
 
-# --------------------------------------------------------------------------- #
-# Validation helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+# Bytecode validation & normalization
+# ---------------------------------------------------------------------------- #
 
-BYTECODE_REGEX = re.compile(r"^(0x)?[0-9a-fA-F]+$", re.IGNORECASE)
+HEX_RE = re.compile(r"^(0x)?[0-9a-fA-F]+$", re.IGNORECASE)
+
+# Solidity metadata patterns (many variations)
+# This covers a264..., a165..., and generic older formats.
+METADATA_RE = re.compile(
+    r"(a26[0-9a-f]{6,}|a165[0-9a-f]{6,})(?:00)?33[0-9a-f]*$",
+    re.IGNORECASE
+)
 
 
 def is_valid_bytecode(data: str) -> bool:
-    return bool(BYTECODE_REGEX.fullmatch(data.strip()))
+    return bool(HEX_RE.fullmatch(data.strip()))
 
 
 def strip_metadata(bytecode: str) -> str:
-    """
-    Remove Solidity compiler metadata trailer if present.
-    Metadata typically starts with `a264` or `a165` and ends with `0033`.
-    """
-    cleaned = re.sub(r"(a26[0-9a-f]{6,})0033.*$", "", bytecode, flags=re.IGNORECASE)
-    return cleaned or bytecode
+    """Remove Solidity metadata trailer (several known patterns)."""
+    cleaned = METADATA_RE.sub("", bytecode)
+    return cleaned if cleaned else bytecode
 
 
-def normalize_bytecode(bytecode: str) -> str:
+def normalize_bytecode(bytecode: str, remove_metadata: bool = True) -> str:
     bc = bytecode.strip().lower()
-    bc = bc[2:] if bc.startswith("0x") else bc
-    bc = strip_metadata(bc)
+    if bc.startswith("0x"):
+        bc = bc[2:]
+
+    bc = re.sub(r"\s+", "", bc)
+    bc = re.sub(r"//.*?$", "", bc)
+
+    if remove_metadata:
+        bc = strip_metadata(bc)
+
     return "0x" + bc
 
 
-# --------------------------------------------------------------------------- #
-# I/O helpers
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+# Input helpers
+# ---------------------------------------------------------------------------- #
 
-def load_bytecode_from_file(path: Path) -> Optional[str]:
+def load_bytecode_from_file(path: Path, remove_metadata: bool) -> Optional[str]:
     try:
         content = path.read_text(encoding="utf-8")
     except Exception as e:
-        logging.error("Failed to read file %s: %s", path, e)
+        logging.error("Failed to read file '%s': %s", path, e)
         return None
 
-    content = re.sub(r"\s+", "", content)
+    content = content.strip().replace("\n", "").replace(" ", "")
     if not content:
-        logging.error("File is empty: %s", path)
+        logging.error("File '%s' is empty.", path)
         return None
 
     if not is_valid_bytecode(content):
-        logging.error("Invalid bytecode format in file: %s", path)
+        logging.error("File '%s' does not contain valid bytecode.", path)
         return None
 
-    return normalize_bytecode(content)
+    return normalize_bytecode(content, remove_metadata)
 
 
-def read_from_stdin() -> Optional[str]:
-    data = sys.stdin.read().strip()
-    if not data:
-        logging.error("No bytecode received via stdin.")
+def read_from_stdin(remove_metadata: bool) -> Optional[str]:
+    data = sys.stdin.read()
+    if not data.strip():
+        logging.error("No bytecode received from stdin.")
         return None
 
     parts = re.split(r"\s+", data)
-    valid = [normalize_bytecode(p) for p in parts if is_valid_bytecode(p)]
+    valid = [normalize_bytecode(p, remove_metadata) for p in parts if is_valid_bytecode(p)]
 
-    if len(valid) == 1:
-        return valid[0]
+    if len(valid) != 1:
+        logging.error("Stdin must contain exactly one bytecode sequence.")
+        return None
 
-    logging.error("Provide exactly one bytecode sequence to stdin.")
-    return None
+    return valid[0]
 
 
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
 # Disassembly
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
 
 def disassemble_bytecode(
     bytecode: str,
     pretty: bool = False,
     json_out: bool = False,
     strict: bool = False
-) -> Union[List[str], List[dict]]:
+) -> Union[List[str], List[Dict[str, Any]]]:
+
     try:
         evm = evmdasm.EvmBytecode(bytecode)
         instructions = evm.disassemble()
-
-        if not instructions:
-            logging.warning("No EVM instructions decoded.")
-            return []
-
-        if strict:
-            unknown = [instr for instr in instructions if instr.name.startswith("INVALID")]
-            if unknown:
-                logging.error("Strict mode: unknown opcodes detected.")
-                return []
-
-        if json_out:
-            return [
-                {
-                    "pc": instr.pc,
-                    "name": instr.name,
-                    "operand": instr.operand,
-                }
-                for instr in instructions
-            ]
-
-        max_len = max(len(i.name) for i in instructions) if pretty else 0
-
-        output = []
-        for instr in instructions:
-            name = instr.name.ljust(max_len) if pretty else instr.name
-            operand = instr.operand or ""
-            output.append(f"{instr.pc:04d}: {name} {operand}".rstrip())
-
-        return output
-
     except Exception as e:
-        logging.exception("Disassembly error: %s", e)
+        logging.exception("evmdasm failed to disassemble bytecode: %s", e)
         return []
 
+    if not instructions:
+        logging.error("No instructions decoded.")
+        return []
 
-# --------------------------------------------------------------------------- #
-# Reporting
-# --------------------------------------------------------------------------- #
+    # Strict mode: reject INVALID opcodes
+    if strict:
+        invalids = [i for i in instructions if i.name.upper().startswith("INVALID")]
+        if invalids:
+            logging.error("Strict mode error: %d invalid opcodes detected.", len(invalids))
+            return []
 
-def summarize(instructions: List[dict]) -> str:
+    if json_out:
+        return [
+            {
+                "pc": instr.pc,
+                "name": instr.name,
+                "operand": instr.operand or None
+            }
+            for instr in instructions
+        ]
+
+    # Pretty printing: align columns
+    if pretty:
+        max_opcode = max(len(i.name) for i in instructions)
+    else:
+        max_opcode = 0
+
+    result: List[str] = []
+    for instr in instructions:
+        name = instr.name.ljust(max_opcode) if pretty else instr.name
+        operand = instr.operand or ""
+        result.append(f"{instr.pc:04d}: {name} {operand}".rstrip())
+
+    return result
+
+
+# ---------------------------------------------------------------------------- #
+# Summary generation
+# ---------------------------------------------------------------------------- #
+
+def summarize(instructions: List[Dict[str, Any]]) -> str:
     counts = Counter(i["name"] for i in instructions)
-    sorted_ops = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    ops = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
 
     lines = ["Opcode Summary:"]
-    lines.extend(f"  {op:<12} {count}" for op, count in sorted_ops)
+    for op, count in ops:
+        lines.append(f"  {op:<12} {count}")
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------- #
+# Output handling
+# ---------------------------------------------------------------------------- #
+
 def output_result(
-    instructions: Union[List[str], List[dict]],
+    data: Union[List[str], List[Dict[str, Any]]],
     outfile: Optional[Path],
     json_out: bool,
     summary_flag: bool
 ) -> int:
-    if not instructions:
-        logging.error("No instructions to output.")
+
+    if not data:
         return EXIT_DISASSEMBLY_ERROR
 
     if json_out:
-        text = json.dumps(instructions, indent=2)
-        if summary_flag and isinstance(instructions[0], dict):
-            text += "\n\n" + summarize(instructions)
+        text = json.dumps(data, indent=2)
+        if summary_flag and isinstance(data[0], dict):
+            text += "\n\n" + summarize(data)
     else:
-        header = f"Disassembled EVM Instructions ({len(instructions)} ops)"
-        body = "\n".join(instructions)
+        header = f"Disassembled EVM Instructions ({len(data)} ops)"
+        body = "\n".join(data)
         text = f"{header}\n{'-' * len(header)}\n{body}"
 
     if outfile:
         try:
             outfile.write_text(text, encoding="utf-8")
-            logging.info("Written to: %s", outfile)
+            logging.info("Output written to '%s'.", outfile)
             return EXIT_SUCCESS
         except Exception as e:
-            logging.error("Failed to write file %s: %s", outfile, e)
+            logging.error("Failed to write to '%s': %s", outfile, e)
             return EXIT_WRITE_ERROR
 
     print(text)
     return EXIT_SUCCESS
 
 
-# --------------------------------------------------------------------------- #
-# Runner
-# --------------------------------------------------------------------------- #
-
-def run(
-    bytecode: str,
-    outfile: Optional[Path],
-    pretty: bool,
-    json_out: bool,
-    summary: bool,
-    strict: bool
-) -> int:
-
-    if not is_valid_bytecode(bytecode):
-        logging.error("Invalid bytecode input.")
-        return EXIT_INVALID_BYTECODE
-
-    bc = normalize_bytecode(bytecode)
-    instructions = disassemble_bytecode(bc, pretty, json_out, strict)
-
-    if not instructions:
-        return EXIT_DISASSEMBLY_ERROR
-
-    return output_result(instructions, outfile, json_out, summary)
-
-
-# --------------------------------------------------------------------------- #
-# CLI parser
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+# CLI
+# ---------------------------------------------------------------------------- #
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Disassemble Ethereum Virtual Machine bytecode.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="EVM Bytecode Disassembler",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    parser.add_argument("--version", action="version", version="EVM Disassembler 2.0")
+    parser.add_argument("--version", action="version", version="EVM Disassembler 2.1")
 
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--bytecode", type=str, help="Raw EVM bytecode")
-    src.add_argument("--file", type=Path, help="File containing EVM bytecode")
-    src.add_argument("--stdin", action="store_true", help="Read bytecode from stdin")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--bytecode", type=str, help="Raw EVM bytecode")
+    group.add_argument("--file", type=Path, help="Text file with bytecode")
+    group.add_argument("--stdin", action="store_true", help="Read bytecode from stdin")
 
-    parser.add_argument("--output", type=Path, help="Save output to file")
+    parser.add_argument("--output", type=Path, help="Write output to a file")
     parser.add_argument("--pretty", action="store_true", help="Aligned output")
-    parser.add_argument("--json", action="store_true", help="Output JSON")
+    parser.add_argument("--json", action="store_true", help="JSON output format")
     parser.add_argument("--summary", action="store_true", help="Include opcode summary")
-    parser.add_argument("--strict", action="store_true", help="Fail on unknown opcodes")
+    parser.add_argument("--strict", action="store_true", help="Fail on INVALID opcodes")
+    parser.add_argument("--no-metadata", action="store_true", help="Do NOT strip metadata")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     return parser.parse_args()
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------------------- #
+# Runner
+# ---------------------------------------------------------------------------- #
 
 def main() -> int:
     args = parse_args()
     setup_logging(logging.DEBUG if args.debug else logging.INFO)
 
+    remove_metadata = not args.no_metadata
+
     if args.bytecode:
-        bc = args.bytecode
+        bc = normalize_bytecode(args.bytecode, remove_metadata)
     elif args.file:
-        bc = load_bytecode_from_file(args.file)
-    else:  # stdin
-        bc = read_from_stdin()
+        bc = load_bytecode_from_file(args.file, remove_metadata)
+    else:
+        bc = read_from_stdin(remove_metadata)
 
     if not bc:
         return EXIT_READ_ERROR
 
-    return run(
+    if not is_valid_bytecode(bc):
+        logging.error("Invalid bytecode input.")
+        return EXIT_INVALID_BYTECODE
+
+    instructions = disassemble_bytecode(
         bc,
-        args.output,
-        args.pretty,
-        args.json,
-        args.summary,
-        args.strict
+        pretty=args.pretty,
+        json_out=args.json,
+        strict=args.strict
+    )
+
+    return output_result(
+        instructions,
+        outfile=args.output,
+        json_out=args.json,
+        summary_flag=args.summary
     )
 
 
