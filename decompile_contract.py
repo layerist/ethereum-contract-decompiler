@@ -82,7 +82,7 @@ def normalize_bytecode(raw: str, *, remove_metadata: bool) -> str:
     """
     Normalize raw input into canonical, lowercase, 0x-prefixed bytecode.
     """
-    # Remove comments and whitespace
+    # Remove comments and all whitespace
     cleaned = re.sub(r"//.*?$", "", raw, flags=re.MULTILINE)
     cleaned = re.sub(r"\s+", "", cleaned).lower()
 
@@ -98,6 +98,9 @@ def normalize_bytecode(raw: str, *, remove_metadata: bool) -> str:
     if len(cleaned) % 2 != 0:
         raise ValueError("Hex string length must be even")
 
+    if not is_valid_hex(cleaned):
+        raise ValueError("Non-hex characters detected")
+
     return f"0x{cleaned}"
 
 
@@ -106,6 +109,7 @@ def normalize_bytecode(raw: str, *, remove_metadata: bool) -> str:
 # =============================================================================
 
 def load_from_file(path: Path, *, remove_metadata: bool) -> str:
+    """Load and normalize bytecode from a file."""
     try:
         raw = path.read_text(encoding="utf-8")
     except Exception as exc:
@@ -115,6 +119,7 @@ def load_from_file(path: Path, *, remove_metadata: bool) -> str:
 
 
 def load_from_stdin(*, remove_metadata: bool) -> str:
+    """Load and normalize bytecode from stdin."""
     raw = sys.stdin.read()
     if not raw.strip():
         raise ValueError("No input received from stdin")
@@ -149,13 +154,13 @@ def disassemble(
         raise RuntimeError("No instructions decoded")
 
     if strict:
-        invalid_ops = [
+        invalid = [
             ins for ins in instructions
             if ins.name.upper().startswith("INVALID")
         ]
-        if invalid_ops:
+        if invalid:
             raise RuntimeError(
-                f"Strict mode violation: {len(invalid_ops)} INVALID opcode(s) found"
+                f"Strict mode violation: {len(invalid)} INVALID opcode(s) found"
             )
 
     if json_out:
@@ -170,7 +175,8 @@ def disassemble(
 
     pad = max(len(ins.name) for ins in instructions) if pretty else 0
     return [
-        f"{ins.pc:04d}: {ins.name.ljust(pad) if pretty else ins.name}"
+        f"{ins.pc:04d}: "
+        f"{ins.name.ljust(pad) if pretty else ins.name}"
         f"{f' {ins.operand}' if ins.operand else ''}"
         for ins in instructions
     ]
@@ -229,7 +235,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--version", action="version", version="EVM Disassembler 2.3")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="EVM Disassembler 2.4",
+    )
 
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--bytecode", help="Raw EVM bytecode")
@@ -239,9 +249,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Write output to file")
     parser.add_argument("--pretty", action="store_true", help="Align opcodes")
     parser.add_argument("--json", action="store_true", help="JSON output")
-    parser.add_argument("--summary", action="store_true", help="Opcode summary")
+    parser.add_argument("--summary", action="store_true", help="Opcode frequency summary")
     parser.add_argument("--strict", action="store_true", help="Fail on INVALID opcodes")
-    parser.add_argument("--no-metadata", action="store_true", help="Preserve Solidity metadata")
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="Do NOT strip Solidity compiler metadata",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     return parser.parse_args()
@@ -271,9 +285,6 @@ def main() -> int:
                 remove_metadata=not args.no_metadata,
             )
 
-        if not is_valid_hex(bytecode):
-            raise ValueError("Invalid hex bytecode")
-
         result = disassemble(
             bytecode,
             pretty=args.pretty,
@@ -301,6 +312,10 @@ def main() -> int:
     except RuntimeError as exc:
         logging.error("%s", exc)
         return EXIT_DISASSEMBLY_ERROR
+
+    except Exception:
+        logging.exception("Unexpected fatal error")
+        return EXIT_WRITE_ERROR
 
 
 if __name__ == "__main__":
