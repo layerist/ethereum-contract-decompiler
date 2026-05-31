@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-Hardened EVM Bytecode Disassembler v3
+Ultra-Hardened EVM Bytecode Disassembler v4
 ===========================================
 
 Major Improvements over v2
