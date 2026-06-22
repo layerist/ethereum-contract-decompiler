@@ -1,42 +1,27 @@
 #!/usr/bin/env python3
 """
-Ultra-Hardened EVM Bytecode Disassembler v4
+Ultra-Hardened EVM Bytecode Disassembler v5
 ===========================================
 
-Major Improvements over v2
---------------------------
-• Fully streaming disassembly
-• Huge contract support
-• Better CBOR metadata stripping
-• PUSH-aware control flow analysis
-• JUMPDEST discovery
-• Static jump edge extraction
-• Safer invalid opcode handling
-• Faster byte access using memoryview
-• Rich JSON schema
-• Optional colored output
-• Opcode category analysis
-• Entropy calculation
-• Function selector extraction
-• Basic dispatcher detection
-• Runtime/initcode heuristic
-• Multi-format output
-• Deterministic stable output
-• Better evmdasm compatibility handling
-• Proper EOF handling
-• Safer exception boundaries
-• Performance optimized for very large contracts
+A dependency-light EVM bytecode disassembler and analyzer.
 
-Requirements
+Key features
 ------------
-pip install evmdasm
+- Pure-Python decoder; no mandatory evmdasm dependency.
+- Handles PUSH0/PUSH1..PUSH32, DUP/SWAP/LOG ranges and modern EVM opcodes.
+- Strict bytecode validation with comments/whitespace stripping.
+- Solidity CBOR metadata stripping with optional metadata diagnostics.
+- PUSH-aware instruction sizing, including truncated PUSH detection.
+- JUMPDEST discovery and conservative static jump edge extraction.
+- Function selector extraction from PUSH4 patterns.
+- Opcode/category summaries, entropy, gas approximation and JSON output.
+- Deterministic output and explicit exit codes.
 
 Usage
 -----
-python disasm.py --bytecode 0x60806040...
-python disasm.py --file contract.hex --json
-cat contract.hex | python disasm.py --stdin --summary
-
+python evm_disasm_improved.py --bytecode 0x60806040 --summary
+python evm_disasm_improved.py --file contract.hex --json --cfg
+cat contract.hex | python evm_disasm_improved.py --stdin --summary
 """
 
 from __future__ import annotations
@@ -46,23 +31,12 @@ import json
 import logging
 import math
 import re
-import shutil
 import sys
 from collections import Counter
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
-from typing import (
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
-
-import evmdasm
+from typing import Iterable, Iterator, List, Optional, Set, Tuple
 
 
 # =============================================================================
@@ -95,19 +69,11 @@ def setup_logging(debug: bool) -> None:
 # Constants
 # =============================================================================
 
+SCRIPT_VERSION = "5.0"
 HEX_RE = re.compile(r"^[0-9a-f]+$")
 COMMENT_RE = re.compile(r"(//.*?$|#.*?$)", re.MULTILINE)
-
 MAX_BYTECODE_SIZE = 50_000_000
-
-# Solidity panic selector
 PANIC_SELECTOR = "4e487b71"
-
-# Common dispatcher pattern
-DISPATCH_SIG = b"\x63"
-
-# ANSI colors
-COLOR_ENABLED = sys.stdout.isatty()
 
 RESET = "\033[0m"
 RED = "\033[91m"
@@ -116,80 +82,75 @@ YELLOW = "\033[93m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
 
-# EVM opcode categories
 ARITHMETIC_OPS = {
-    "ADD", "SUB", "MUL", "DIV", "SDIV",
-    "MOD", "SMOD", "ADDMOD", "MULMOD", "EXP",
+    "ADD", "MUL", "SUB", "DIV", "SDIV", "MOD", "SMOD", "ADDMOD", "MULMOD", "EXP", "SIGNEXTEND",
 }
-
 LOGIC_OPS = {
-    "LT", "GT", "SLT", "SGT", "EQ",
-    "ISZERO", "AND", "OR", "XOR", "NOT",
-    "BYTE", "SHL", "SHR", "SAR",
+    "LT", "GT", "SLT", "SGT", "EQ", "ISZERO", "AND", "OR", "XOR", "NOT", "BYTE", "SHL", "SHR", "SAR",
 }
-
 CONTROL_FLOW_OPS = {
-    "JUMP", "JUMPI", "STOP",
-    "RETURN", "REVERT", "INVALID",
-    "SELFDESTRUCT",
+    "JUMP", "JUMPI", "STOP", "RETURN", "REVERT", "INVALID", "SELFDESTRUCT",
 }
-
 MEMORY_OPS = {
-    "MLOAD", "MSTORE", "MSTORE8",
-    "SLOAD", "SSTORE",
+    "MLOAD", "MSTORE", "MSTORE8", "SLOAD", "SSTORE", "MSIZE", "MCOPY", "TLOAD", "TSTORE",
 }
-
 CALL_OPS = {
-    "CALL", "DELEGATECALL", "STATICCALL",
-    "CALLCODE", "CREATE", "CREATE2",
+    "CALL", "CALLCODE", "DELEGATECALL", "STATICCALL", "CREATE", "CREATE2",
+}
+ENV_OPS = {
+    "ADDRESS", "BALANCE", "ORIGIN", "CALLER", "CALLVALUE", "CALLDATALOAD", "CALLDATASIZE", "CALLDATACOPY",
+    "CODESIZE", "CODECOPY", "GASPRICE", "EXTCODESIZE", "EXTCODECOPY", "RETURNDATASIZE", "RETURNDATACOPY",
+    "EXTCODEHASH", "BLOCKHASH", "COINBASE", "TIMESTAMP", "NUMBER", "PREVRANDAO", "GASLIMIT", "CHAINID",
+    "SELFBALANCE", "BASEFEE", "BLOBHASH", "BLOBBASEFEE", "GAS", "PC",
 }
 
-# Extended gas fallback
-GAS_FALLBACK = {
-    "STOP": 0,
-    "ADD": 3,
-    "MUL": 5,
-    "SUB": 3,
-    "DIV": 5,
-    "SDIV": 5,
-    "MOD": 5,
-    "SMOD": 5,
-    "ADDMOD": 8,
-    "MULMOD": 8,
-    "EXP": 10,
-    "SIGNEXTEND": 5,
-    "LT": 3,
-    "GT": 3,
-    "SLT": 3,
-    "SGT": 3,
-    "EQ": 3,
-    "ISZERO": 3,
-    "AND": 3,
-    "OR": 3,
-    "XOR": 3,
-    "NOT": 3,
-    "BYTE": 3,
-    "SHL": 3,
-    "SHR": 3,
-    "SAR": 3,
-    "SHA3": 30,
-    "MLOAD": 3,
-    "MSTORE": 3,
-    "MSTORE8": 3,
-    "SLOAD": 100,
-    "SSTORE": 100,
-    "JUMP": 8,
-    "JUMPI": 10,
-    "JUMPDEST": 1,
-    "PUSH1": 3,
-    "PUSH32": 3,
-    "DUP1": 3,
-    "SWAP1": 3,
-    "CALL": 700,
-    "RETURN": 0,
-    "REVERT": 0,
-    "INVALID": 0,
+OPCODES = {
+    0x00: "STOP", 0x01: "ADD", 0x02: "MUL", 0x03: "SUB", 0x04: "DIV", 0x05: "SDIV", 0x06: "MOD",
+    0x07: "SMOD", 0x08: "ADDMOD", 0x09: "MULMOD", 0x0A: "EXP", 0x0B: "SIGNEXTEND",
+    0x10: "LT", 0x11: "GT", 0x12: "SLT", 0x13: "SGT", 0x14: "EQ", 0x15: "ISZERO", 0x16: "AND",
+    0x17: "OR", 0x18: "XOR", 0x19: "NOT", 0x1A: "BYTE", 0x1B: "SHL", 0x1C: "SHR", 0x1D: "SAR",
+    0x20: "SHA3",
+    0x30: "ADDRESS", 0x31: "BALANCE", 0x32: "ORIGIN", 0x33: "CALLER", 0x34: "CALLVALUE", 0x35: "CALLDATALOAD",
+    0x36: "CALLDATASIZE", 0x37: "CALLDATACOPY", 0x38: "CODESIZE", 0x39: "CODECOPY", 0x3A: "GASPRICE",
+    0x3B: "EXTCODESIZE", 0x3C: "EXTCODECOPY", 0x3D: "RETURNDATASIZE", 0x3E: "RETURNDATACOPY", 0x3F: "EXTCODEHASH",
+    0x40: "BLOCKHASH", 0x41: "COINBASE", 0x42: "TIMESTAMP", 0x43: "NUMBER", 0x44: "PREVRANDAO", 0x45: "GASLIMIT",
+    0x46: "CHAINID", 0x47: "SELFBALANCE", 0x48: "BASEFEE", 0x49: "BLOBHASH", 0x4A: "BLOBBASEFEE",
+    0x50: "POP", 0x51: "MLOAD", 0x52: "MSTORE", 0x53: "MSTORE8", 0x54: "SLOAD", 0x55: "SSTORE", 0x56: "JUMP",
+    0x57: "JUMPI", 0x58: "PC", 0x59: "MSIZE", 0x5A: "GAS", 0x5B: "JUMPDEST", 0x5C: "TLOAD", 0x5D: "TSTORE",
+    0x5E: "MCOPY", 0x5F: "PUSH0",
+    0xA0: "LOG0", 0xA1: "LOG1", 0xA2: "LOG2", 0xA3: "LOG3", 0xA4: "LOG4",
+    0xF0: "CREATE", 0xF1: "CALL", 0xF2: "CALLCODE", 0xF3: "RETURN", 0xF4: "DELEGATECALL", 0xF5: "CREATE2",
+    0xFA: "STATICCALL", 0xFD: "REVERT", 0xFE: "INVALID", 0xFF: "SELFDESTRUCT",
 }
+for code in range(0x60, 0x80):
+    OPCODES[code] = f"PUSH{code - 0x5F}"
+for code in range(0x80, 0x90):
+    OPCODES[code] = f"DUP{code - 0x7F}"
+for code in range(0x90, 0xA0):
+    OPCODES[code] = f"SWAP{code - 0x8F}"
+
+GAS_FALLBACK = {
+    "STOP": 0, "ADD": 3, "MUL": 5, "SUB": 3, "DIV": 5, "SDIV": 5, "MOD": 5, "SMOD": 5,
+    "ADDMOD": 8, "MULMOD": 8, "EXP": 10, "SIGNEXTEND": 5, "LT": 3, "GT": 3, "SLT": 3,
+    "SGT": 3, "EQ": 3, "ISZERO": 3, "AND": 3, "OR": 3, "XOR": 3, "NOT": 3, "BYTE": 3,
+    "SHL": 3, "SHR": 3, "SAR": 3, "SHA3": 30, "ADDRESS": 2, "BALANCE": 100, "ORIGIN": 2,
+    "CALLER": 2, "CALLVALUE": 2, "CALLDATALOAD": 3, "CALLDATASIZE": 2, "CALLDATACOPY": 3,
+    "CODESIZE": 2, "CODECOPY": 3, "GASPRICE": 2, "EXTCODESIZE": 100, "EXTCODECOPY": 100,
+    "RETURNDATASIZE": 2, "RETURNDATACOPY": 3, "EXTCODEHASH": 100, "BLOCKHASH": 20, "COINBASE": 2,
+    "TIMESTAMP": 2, "NUMBER": 2, "PREVRANDAO": 2, "GASLIMIT": 2, "CHAINID": 2, "SELFBALANCE": 5,
+    "BASEFEE": 2, "BLOBHASH": 3, "BLOBBASEFEE": 2, "POP": 2, "MLOAD": 3, "MSTORE": 3,
+    "MSTORE8": 3, "SLOAD": 100, "SSTORE": 100, "JUMP": 8, "JUMPI": 10, "PC": 2, "MSIZE": 2,
+    "GAS": 2, "JUMPDEST": 1, "TLOAD": 100, "TSTORE": 100, "MCOPY": 3, "PUSH0": 2, "CREATE": 32000,
+    "CALL": 700, "CALLCODE": 700, "RETURN": 0, "DELEGATECALL": 700, "CREATE2": 32000, "STATICCALL": 700,
+    "REVERT": 0, "INVALID": 0, "SELFDESTRUCT": 5000,
+}
+for n in range(1, 33):
+    GAS_FALLBACK[f"PUSH{n}"] = 3
+for n in range(1, 17):
+    GAS_FALLBACK[f"DUP{n}"] = 3
+    GAS_FALLBACK[f"SWAP{n}"] = 3
+for n in range(5):
+    GAS_FALLBACK[f"LOG{n}"] = 375
 
 
 # =============================================================================
@@ -206,17 +167,33 @@ class Instruction:
     gas: int
     category: str
     is_invalid: bool
+    is_unknown: bool
     is_jumpdest: bool
+    is_push_truncated: bool
     jump_target: Optional[int]
 
 
 @dataclass(frozen=True)
+class MetadataInfo:
+    original_size: int
+    stripped_size: int
+    stripped: bool
+    offset: Optional[int]
+    length: Optional[int]
+
+
+@dataclass(frozen=True)
 class AnalysisSummary:
+    bytecode_size: int
     instruction_count: int
     unique_opcodes: int
     jumpdest_count: int
     invalid_count: int
+    unknown_count: int
+    truncated_push_count: int
     function_selectors: List[str]
+    selector_count: int
+    has_panic_selector: bool
     entropy: float
     avg_gas: float
     runtime_likely: bool
@@ -226,8 +203,8 @@ class AnalysisSummary:
 # Utilities
 # =============================================================================
 
-def colorize(text: str, color: str) -> str:
-    if not COLOR_ENABLED:
+def colorize(text: str, color: str, *, enabled: bool) -> str:
+    if not enabled:
         return text
     return f"{color}{text}{RESET}"
 
@@ -245,295 +222,209 @@ def strip_0x(value: str) -> str:
 def validate_hex(body: str) -> None:
     if not body:
         raise ValueError("Empty bytecode")
-
     if len(body) % 2:
         raise ValueError("Hex string length must be even")
-
     if not HEX_RE.fullmatch(body):
         raise ValueError("Invalid hex characters detected")
-
     if len(body) // 2 > MAX_BYTECODE_SIZE:
-        raise ValueError("Bytecode exceeds maximum size")
+        raise ValueError(f"Bytecode exceeds maximum size: {MAX_BYTECODE_SIZE} bytes")
 
 
 # =============================================================================
 # Metadata stripping
 # =============================================================================
 
-def strip_metadata_cbor(bytecode: bytes) -> bytes:
-    """
-    Solidity metadata stripping.
-
-    Solidity usually appends:
-        <cbor> <2-byte length>
-
-    Common CBOR prefixes:
-        a1
-        a2
-        a3
-    """
+def strip_metadata_cbor(bytecode: bytes) -> Tuple[bytes, MetadataInfo]:
+    """Strip Solidity-style trailing CBOR metadata when it is clearly detected."""
+    original_size = len(bytecode)
+    no_strip = MetadataInfo(original_size, original_size, False, None, None)
 
     if len(bytecode) < 4:
-        return bytecode
+        return bytecode, no_strip
 
     meta_len = int.from_bytes(bytecode[-2:], "big")
-
-    if meta_len <= 0:
-        return bytecode
-
-    if meta_len + 2 > len(bytecode):
-        return bytecode
+    if meta_len <= 0 or meta_len + 2 > len(bytecode):
+        return bytecode, no_strip
 
     start = len(bytecode) - meta_len - 2
-
     if start < 0:
-        return bytecode
+        return bytecode, no_strip
 
-    if bytecode[start] in (0xA1, 0xA2, 0xA3):
-        LOG.debug(
-            "Detected Solidity CBOR metadata "
-            "(offset=%d length=%d)",
-            start,
-            meta_len,
-        )
-        return bytecode[:start]
+    # Solidity metadata is CBOR and commonly starts with a1/a2/a3/a4, but future compilers may add more keys.
+    if bytecode[start] in range(0xA1, 0xB0):
+        stripped = bytecode[:start]
+        LOG.debug("Detected CBOR metadata at offset=%d length=%d", start, meta_len)
+        return stripped, MetadataInfo(original_size, len(stripped), True, start, meta_len)
 
-    return bytecode
+    return bytecode, no_strip
 
 
-def normalize_bytecode(raw: str, *, remove_metadata: bool) -> bytes:
-    cleaned = clean_raw_input(raw)
-    cleaned = strip_0x(cleaned)
-
+def normalize_bytecode(raw: str, *, remove_metadata: bool) -> Tuple[bytes, MetadataInfo]:
+    cleaned = strip_0x(clean_raw_input(raw))
     validate_hex(cleaned)
-
     data = bytes.fromhex(cleaned)
 
     if remove_metadata:
-        data = strip_metadata_cbor(data)
+        return strip_metadata_cbor(data)
 
-    return data
+    size = len(data)
+    return data, MetadataInfo(size, size, False, None, None)
 
 
 # =============================================================================
 # Input
 # =============================================================================
 
-def load_from_file(path: Path, *, remove_metadata: bool) -> bytes:
+def load_from_file(path: Path, *, remove_metadata: bool) -> Tuple[bytes, MetadataInfo]:
     try:
         raw = path.read_text(encoding="utf-8")
     except Exception as e:
-        raise IOError(f"Failed reading file: {e}") from e
-
-    return normalize_bytecode(
-        raw,
-        remove_metadata=remove_metadata,
-    )
+        raise IOError(f"Failed reading file {path}: {e}") from e
+    return normalize_bytecode(raw, remove_metadata=remove_metadata)
 
 
-def load_from_stdin(*, remove_metadata: bool) -> bytes:
+def load_from_stdin(*, remove_metadata: bool) -> Tuple[bytes, MetadataInfo]:
     raw = sys.stdin.read()
-
     if not raw.strip():
         raise ValueError("Empty stdin input")
-
-    return normalize_bytecode(
-        raw,
-        remove_metadata=remove_metadata,
-    )
+    return normalize_bytecode(raw, remove_metadata=remove_metadata)
 
 
 # =============================================================================
-# Analysis
+# Analysis helpers
 # =============================================================================
 
 def calculate_entropy(data: bytes) -> float:
     if not data:
         return 0.0
-
     counter = Counter(data)
     length = len(data)
-
     entropy = 0.0
-
     for count in counter.values():
         p = count / length
         entropy -= p * math.log2(p)
-
     return round(entropy, 4)
 
 
 def opcode_category(opcode: str) -> str:
     if opcode in ARITHMETIC_OPS:
         return "arithmetic"
-
     if opcode in LOGIC_OPS:
         return "logic"
-
     if opcode in CONTROL_FLOW_OPS:
         return "control_flow"
-
     if opcode in MEMORY_OPS:
-        return "memory"
-
+        return "memory_storage"
     if opcode in CALL_OPS:
-        return "call"
-
+        return "call_create"
+    if opcode in ENV_OPS:
+        return "environment"
+    if opcode == "POP":
+        return "stack"
     if opcode.startswith("PUSH"):
         return "push"
-
     if opcode.startswith("DUP"):
         return "dup"
-
     if opcode.startswith("SWAP"):
         return "swap"
-
+    if opcode.startswith("LOG"):
+        return "log"
+    if opcode.startswith("UNKNOWN_"):
+        return "unknown"
     return "other"
 
 
 def extract_function_selectors(bytecode: bytes) -> List[str]:
-    """
-    Extract likely function selectors from PUSH4 patterns.
-    """
-
+    """Extract likely selectors from PUSH4 patterns, avoiding PUSH data false-walk where possible."""
     selectors: Set[str] = set()
-
-    mv = memoryview(bytecode)
-    length = len(bytecode)
-
-    i = 0
-
-    while i < length - 5:
-        if mv[i] == 0x63:
-            selector = bytes(mv[i + 1:i + 5]).hex()
-
-            if selector != "ffffffff":
+    for ins in disassemble_stream(bytecode):
+        if ins.opcode == "PUSH4" and ins.operand:
+            selector = ins.operand[2:]
+            if selector not in {"00000000", "ffffffff", PANIC_SELECTOR}:
                 selectors.add(selector)
-
-            i += 5
-        else:
-            i += 1
-
     return sorted(selectors)
 
 
 def detect_runtime_code(bytecode: bytes) -> bool:
-    """
-    Very rough heuristic.
-    """
+    """Heuristic: runtime bytecode often contains dispatcher/call/return/revert logic."""
+    return any(op in bytecode for op in (b"\x35", b"\x36", b"\xf3", b"\xfd"))
 
-    if b"\xf3" in bytecode:
-        return True
 
-    if b"\xfd" in bytecode:
-        return True
-
-    return False
+def gas_cost(opcode: str) -> int:
+    return GAS_FALLBACK.get(opcode, -1)
 
 
 # =============================================================================
 # Disassembly
 # =============================================================================
 
-def gas_cost(ins) -> int:
-    if hasattr(ins, "gas") and ins.gas is not None:
-        return ins.gas
-
-    return GAS_FALLBACK.get(ins.name, -1)
-
-
-def detect_invalid(bytecode: memoryview, pc: int) -> bool:
-    return bytecode[pc] == 0xFE
+def decode_opcode(byte_value: int) -> Tuple[str, bool]:
+    opcode = OPCODES.get(byte_value)
+    if opcode is None:
+        return f"UNKNOWN_0x{byte_value:02x}", True
+    return opcode, False
 
 
-def jump_target(ins) -> Optional[int]:
-    if not ins.name.startswith("PUSH"):
-        return None
-
-    if not ins.operand:
-        return None
-
-    try:
-        return int.from_bytes(ins.operand, "big")
-    except Exception:
-        return None
+def push_length(opcode: str) -> int:
+    if opcode == "PUSH0":
+        return 0
+    if opcode.startswith("PUSH") and opcode[4:].isdigit():
+        return int(opcode[4:])
+    return 0
 
 
-def safe_operand_hex(operand) -> Optional[str]:
-    if not operand:
-        return None
-
-    try:
-        return f"0x{operand.hex()}"
-    except Exception:
-        return None
-
-
-def disassemble_stream(
-    bytecode: bytes,
-) -> Iterator[Instruction]:
-
+def disassemble_stream(bytecode: bytes) -> Iterator[Instruction]:
     mv = memoryview(bytecode)
+    pc = 0
+    length = len(bytecode)
 
-    try:
-        evm = evmdasm.EvmBytecode(bytecode.hex())
-        instructions = evm.disassemble()
-    except Exception as e:
-        raise RuntimeError(
-            f"evmdasm disassembly failed: {e}"
-        ) from e
+    while pc < length:
+        byte_value = mv[pc]
+        opcode, is_unknown = decode_opcode(byte_value)
+        operand_len = push_length(opcode)
+        available_operand_len = max(0, min(operand_len, length - pc - 1))
+        operand_bytes = bytes(mv[pc + 1:pc + 1 + available_operand_len])
+        size = 1 + available_operand_len
+        is_push_truncated = available_operand_len < operand_len
+        operand_hex = f"0x{operand_bytes.hex()}" if operand_len else None
+        raw = bytes(mv[pc:pc + size]).hex()
+        target = int.from_bytes(operand_bytes, "big") if operand_len and not is_push_truncated else None
 
-    for ins in instructions:
-        try:
-            pc = ins.pc
-            operand = safe_operand_hex(ins.operand)
-            size = 1 + len(ins.operand or b"")
+        yield Instruction(
+            pc=pc,
+            opcode=opcode,
+            operand=operand_hex,
+            size=size,
+            raw=raw,
+            gas=gas_cost(opcode),
+            category=opcode_category(opcode),
+            is_invalid=(byte_value == 0xFE),
+            is_unknown=is_unknown,
+            is_jumpdest=(opcode == "JUMPDEST"),
+            is_push_truncated=is_push_truncated,
+            jump_target=target,
+        )
 
-            raw = bytes(mv[pc:pc + size]).hex()
-
-            yield Instruction(
-                pc=pc,
-                opcode=ins.name,
-                operand=operand,
-                size=size,
-                raw=raw,
-                gas=gas_cost(ins),
-                category=opcode_category(ins.name),
-                is_invalid=detect_invalid(mv, pc),
-                is_jumpdest=(ins.name == "JUMPDEST"),
-                jump_target=jump_target(ins),
-            )
-
-        except Exception as e:
-            LOG.debug(
-                "Skipping malformed instruction at pc=%s: %s",
-                getattr(ins, "pc", "?"),
-                e,
-            )
+        pc += size
 
 
-def disassemble(
-    bytecode: bytes,
-    *,
-    pc_start: Optional[int],
-    pc_end: Optional[int],
-) -> List[Instruction]:
+def disassemble(bytecode: bytes, *, pc_start: Optional[int], pc_end: Optional[int]) -> List[Instruction]:
+    if pc_start is not None and pc_start < 0:
+        raise ValueError("--pc-start must be >= 0")
+    if pc_end is not None and pc_end < 0:
+        raise ValueError("--pc-end must be >= 0")
+    if pc_start is not None and pc_end is not None and pc_start > pc_end:
+        raise ValueError("--pc-start must be <= --pc-end")
 
-    result: List[Instruction] = []
-
-    for ins in disassemble_stream(bytecode):
-
-        if pc_start is not None and ins.pc < pc_start:
-            continue
-
-        if pc_end is not None and ins.pc > pc_end:
-            continue
-
-        result.append(ins)
+    result = [
+        ins
+        for ins in disassemble_stream(bytecode)
+        if (pc_start is None or ins.pc >= pc_start)
+        and (pc_end is None or ins.pc <= pc_end)
+    ]
 
     if not result:
-        raise RuntimeError("No instructions decoded")
-
+        raise RuntimeError("No instructions decoded in the selected PC range")
     return result
 
 
@@ -541,40 +432,19 @@ def disassemble(
 # CFG / Jump Analysis
 # =============================================================================
 
-def discover_jumpdests(
-    instructions: Iterable[Instruction],
-) -> Set[int]:
-
-    return {
-        ins.pc
-        for ins in instructions
-        if ins.is_jumpdest
-    }
+def discover_jumpdests(instructions: Iterable[Instruction]) -> Set[int]:
+    return {ins.pc for ins in instructions if ins.is_jumpdest}
 
 
-def static_jump_edges(
-    instructions: List[Instruction],
-    jumpdests: Set[int],
-) -> List[Tuple[int, int]]:
-
-    edges = []
-
-    for idx, ins in enumerate(instructions[:-1]):
-
-        if ins.opcode not in ("JUMP", "JUMPI"):
+def static_jump_edges(instructions: List[Instruction], jumpdests: Set[int]) -> List[Tuple[int, int]]:
+    """Conservative edge extraction: only PUSH<N> immediately before JUMP/JUMPI is treated as static."""
+    edges: List[Tuple[int, int]] = []
+    for idx, ins in enumerate(instructions):
+        if ins.opcode not in {"JUMP", "JUMPI"} or idx == 0:
             continue
-
-        prev_ins = instructions[idx - 1] if idx > 0 else None
-
-        if not prev_ins:
-            continue
-
-        if prev_ins.jump_target is None:
-            continue
-
-        if prev_ins.jump_target in jumpdests:
+        prev_ins = instructions[idx - 1]
+        if prev_ins.jump_target is not None and prev_ins.jump_target in jumpdests:
             edges.append((ins.pc, prev_ins.jump_target))
-
     return edges
 
 
@@ -582,55 +452,31 @@ def static_jump_edges(
 # Summary
 # =============================================================================
 
-def build_summary(
-    instructions: List[Instruction],
-    bytecode: bytes,
-) -> AnalysisSummary:
-
-    gas_values = [
-        i.gas
-        for i in instructions
-        if i.gas >= 0
-    ]
-
+def build_summary(instructions: List[Instruction], bytecode: bytes) -> AnalysisSummary:
+    gas_values = [i.gas for i in instructions if i.gas >= 0]
+    selectors = extract_function_selectors(bytecode)
     return AnalysisSummary(
+        bytecode_size=len(bytecode),
         instruction_count=len(instructions),
-        unique_opcodes=len(
-            set(i.opcode for i in instructions)
-        ),
-        jumpdest_count=sum(
-            1 for i in instructions if i.is_jumpdest
-        ),
-        invalid_count=sum(
-            1 for i in instructions if i.is_invalid
-        ),
-        function_selectors=extract_function_selectors(bytecode),
+        unique_opcodes=len({i.opcode for i in instructions}),
+        jumpdest_count=sum(1 for i in instructions if i.is_jumpdest),
+        invalid_count=sum(1 for i in instructions if i.is_invalid),
+        unknown_count=sum(1 for i in instructions if i.is_unknown),
+        truncated_push_count=sum(1 for i in instructions if i.is_push_truncated),
+        function_selectors=selectors,
+        selector_count=len(selectors),
+        has_panic_selector=PANIC_SELECTOR in {i.operand[2:] for i in instructions if i.opcode == "PUSH4" and i.operand},
         entropy=calculate_entropy(bytecode),
-        avg_gas=round(mean(gas_values), 2)
-        if gas_values else 0.0,
+        avg_gas=round(mean(gas_values), 2) if gas_values else 0.0,
         runtime_likely=detect_runtime_code(bytecode),
     )
 
 
-def opcode_summary(
-    instructions: Iterable[Instruction],
-) -> str:
-
+def opcode_summary(instructions: Iterable[Instruction], *, color: bool) -> str:
     counter = Counter(i.opcode for i in instructions)
-
-    lines = []
-
-    lines.append(colorize(
-        "Opcode Summary:",
-        CYAN,
-    ))
-
-    for op, count in sorted(
-        counter.items(),
-        key=lambda x: (-x[1], x[0]),
-    ):
+    lines = [colorize("Opcode Summary:", CYAN, enabled=color)]
+    for op, count in sorted(counter.items(), key=lambda x: (-x[1], x[0])):
         lines.append(f"  {op:<18} {count}")
-
     return "\n".join(lines)
 
 
@@ -638,164 +484,107 @@ def opcode_summary(
 # Output
 # =============================================================================
 
-def instruction_to_text(i: Instruction) -> str:
-
+def instruction_to_text(i: Instruction, *, color: bool) -> str:
     opcode = i.opcode
-
-    if i.is_invalid:
-        opcode = colorize(opcode, RED)
-
+    if i.is_invalid or i.is_unknown or i.is_push_truncated:
+        opcode = colorize(opcode, RED, enabled=color)
     elif i.is_jumpdest:
-        opcode = colorize(opcode, GREEN)
-
+        opcode = colorize(opcode, GREEN, enabled=color)
     elif i.category == "control_flow":
-        opcode = colorize(opcode, YELLOW)
-
-    elif i.category == "call":
-        opcode = colorize(opcode, BLUE)
-
-    operand = i.operand or ""
+        opcode = colorize(opcode, YELLOW, enabled=color)
+    elif i.category == "call_create":
+        opcode = colorize(opcode, BLUE, enabled=color)
 
     extra = []
-
     if i.jump_target is not None:
         extra.append(f"target={i.jump_target}")
-
     if i.is_invalid:
         extra.append("INVALID")
+    if i.is_unknown:
+        extra.append("UNKNOWN")
+    if i.is_push_truncated:
+        extra.append("TRUNCATED_PUSH")
 
-    extra_str = (
-        " | " + " ".join(extra)
-        if extra else ""
-    )
-
+    extra_str = " | " + " ".join(extra) if extra else ""
     return (
         f"{i.pc:06d}: "
         f"{opcode:<18} "
-        f"{operand:<70} "
+        f"{(i.operand or ''):<70} "
         f"size={i.size:<2} "
-        f"gas={i.gas:<4} "
+        f"gas={i.gas:<5} "
         f"raw={i.raw}"
         f"{extra_str}"
     )
 
 
+def render_summary(s: AnalysisSummary, *, color: bool) -> List[str]:
+    lines = ["", colorize("Analysis Summary:", CYAN, enabled=color)]
+    lines.extend([
+        f"  Bytecode Size:       {s.bytecode_size} bytes",
+        f"  Instructions:        {s.instruction_count}",
+        f"  Unique Opcodes:      {s.unique_opcodes}",
+        f"  JUMPDESTs:           {s.jumpdest_count}",
+        f"  INVALIDs:            {s.invalid_count}",
+        f"  Unknown Opcodes:     {s.unknown_count}",
+        f"  Truncated PUSH:      {s.truncated_push_count}",
+        f"  Entropy:             {s.entropy}",
+        f"  Avg Gas Approx:      {s.avg_gas}",
+        f"  Runtime Likely:      {s.runtime_likely}",
+        f"  Panic Selector Seen: {s.has_panic_selector}",
+        f"  Selector Count:      {s.selector_count}",
+    ])
+    if s.function_selectors:
+        lines.append(f"  Function Selectors:  {', '.join(s.function_selectors[:30])}")
+        if len(s.function_selectors) > 30:
+            lines.append(f"                       ... +{len(s.function_selectors) - 30} more")
+    return lines
+
+
 def write_output(
     instructions: List[Instruction],
     bytecode: bytes,
+    metadata: MetadataInfo,
     *,
     outfile: Optional[Path],
     json_out: bool,
     summary: bool,
     cfg: bool,
+    color: bool,
 ) -> None:
-
     try:
-
-        text = ""
-
         if json_out:
-
             jumpdests = discover_jumpdests(instructions)
-
             payload = {
-                "summary": asdict(
-                    build_summary(
-                        instructions,
-                        bytecode,
-                    )
-                ),
-                "instructions": [
-                    asdict(i)
-                    for i in instructions
-                ],
+                "version": SCRIPT_VERSION,
+                "metadata": asdict(metadata),
+                "summary": asdict(build_summary(instructions, bytecode)),
+                "instructions": [asdict(i) for i in instructions],
             }
-
             if cfg:
-                payload["cfg_edges"] = static_jump_edges(
-                    instructions,
-                    jumpdests,
-                )
-
-            text = json.dumps(
-                payload,
-                indent=2,
-                sort_keys=True,
-            )
-
+                payload["cfg_edges"] = static_jump_edges(instructions, jumpdests)
+            text = json.dumps(payload, indent=2, sort_keys=True)
         else:
-
-            lines = [
-                instruction_to_text(i)
-                for i in instructions
-            ]
-
+            lines = [instruction_to_text(i, color=color) for i in instructions]
+            if metadata.stripped:
+                lines.append("")
+                lines.append(
+                    f"Metadata stripped: offset={metadata.offset} length={metadata.length} "
+                    f"original={metadata.original_size}B stripped={metadata.stripped_size}B"
+                )
             if summary:
                 lines.append("")
-                lines.append(
-                    opcode_summary(instructions)
-                )
-
-                s = build_summary(
-                    instructions,
-                    bytecode,
-                )
-
-                lines.append("")
-                lines.append(
-                    colorize(
-                        "Analysis Summary:",
-                        CYAN,
-                    )
-                )
-
-                lines.append(
-                    f"  Instructions:       {s.instruction_count}"
-                )
-                lines.append(
-                    f"  Unique Opcodes:     {s.unique_opcodes}"
-                )
-                lines.append(
-                    f"  JUMPDESTs:          {s.jumpdest_count}"
-                )
-                lines.append(
-                    f"  INVALIDs:           {s.invalid_count}"
-                )
-                lines.append(
-                    f"  Entropy:            {s.entropy}"
-                )
-                lines.append(
-                    f"  Avg Gas:            {s.avg_gas}"
-                )
-                lines.append(
-                    f"  Runtime Likely:     {s.runtime_likely}"
-                )
-
-                if s.function_selectors:
-                    lines.append(
-                        f"  Function Selectors: "
-                        f"{', '.join(s.function_selectors[:20])}"
-                    )
-
+                lines.append(opcode_summary(instructions, color=color))
+                lines.extend(render_summary(build_summary(instructions, bytecode), color=color))
             text = "\n".join(lines)
 
         if outfile:
-            outfile.write_text(
-                text,
-                encoding="utf-8",
-            )
-
-            LOG.info(
-                "Saved output to %s",
-                outfile,
-            )
+            outfile.parent.mkdir(parents=True, exist_ok=True)
+            outfile.write_text(text + ("\n" if text else ""), encoding="utf-8")
+            LOG.info("Saved output to %s", outfile)
         else:
             print(text)
-
     except Exception as e:
-        raise IOError(
-            f"Failed writing output: {e}"
-        ) from e
+        raise IOError(f"Failed writing output: {e}") from e
 
 
 # =============================================================================
@@ -803,83 +592,23 @@ def write_output(
 # =============================================================================
 
 def parse_args() -> argparse.Namespace:
-
     parser = argparse.ArgumentParser(
-        description=(
-            "Ultra-Hardened EVM Bytecode "
-            "Disassembler v3"
-        )
+        description=f"Ultra-Hardened EVM Bytecode Disassembler v{SCRIPT_VERSION}"
     )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--bytecode", help="Raw hex bytecode")
+    src.add_argument("--file", type=Path, help="Read bytecode from file")
+    src.add_argument("--stdin", action="store_true", help="Read bytecode from stdin")
 
-    src = parser.add_mutually_exclusive_group(
-        required=True
-    )
-
-    src.add_argument(
-        "--bytecode",
-        help="Raw hex bytecode",
-    )
-
-    src.add_argument(
-        "--file",
-        type=Path,
-        help="Read bytecode from file",
-    )
-
-    src.add_argument(
-        "--stdin",
-        action="store_true",
-        help="Read bytecode from stdin",
-    )
-
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Output file",
-    )
-
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="JSON output",
-    )
-
-    parser.add_argument(
-        "--summary",
-        action="store_true",
-        help="Show analysis summary",
-    )
-
-    parser.add_argument(
-        "--cfg",
-        action="store_true",
-        help="Static CFG edge extraction",
-    )
-
-    parser.add_argument(
-        "--pc-start",
-        type=int,
-        help="Start PC filter",
-    )
-
-    parser.add_argument(
-        "--pc-end",
-        type=int,
-        help="End PC filter",
-    )
-
-    parser.add_argument(
-        "--no-metadata",
-        action="store_true",
-        help="Do NOT strip Solidity metadata",
-    )
-
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging",
-    )
-
+    parser.add_argument("--output", type=Path, help="Output file")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--summary", action="store_true", help="Show analysis summary")
+    parser.add_argument("--cfg", action="store_true", help="Static CFG edge extraction")
+    parser.add_argument("--pc-start", type=int, help="Start PC filter, inclusive")
+    parser.add_argument("--pc-end", type=int, help="End PC filter, inclusive")
+    parser.add_argument("--no-metadata", action="store_true", help="Do NOT strip Solidity CBOR metadata")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
 
@@ -888,86 +617,50 @@ def parse_args() -> argparse.Namespace:
 # =============================================================================
 
 def main() -> int:
-
     args = parse_args()
-
     setup_logging(args.debug)
 
     try:
-
         if args.bytecode:
-
-            bytecode = normalize_bytecode(
-                args.bytecode,
-                remove_metadata=not args.no_metadata,
-            )
-
+            bytecode, metadata = normalize_bytecode(args.bytecode, remove_metadata=not args.no_metadata)
         elif args.file:
-
-            bytecode = load_from_file(
-                args.file,
-                remove_metadata=not args.no_metadata,
-            )
-
+            bytecode, metadata = load_from_file(args.file, remove_metadata=not args.no_metadata)
         else:
+            bytecode, metadata = load_from_stdin(remove_metadata=not args.no_metadata)
 
-            bytecode = load_from_stdin(
-                remove_metadata=not args.no_metadata,
-            )
+        LOG.info("Loaded %d bytes", len(bytecode))
+        if metadata.stripped:
+            LOG.info("Stripped CBOR metadata: %d -> %d bytes", metadata.original_size, metadata.stripped_size)
 
-        LOG.info(
-            "Loaded %d bytes",
-            len(bytecode),
-        )
-
-        instructions = disassemble(
-            bytecode,
-            pc_start=args.pc_start,
-            pc_end=args.pc_end,
-        )
+        instructions = disassemble(bytecode, pc_start=args.pc_start, pc_end=args.pc_end)
+        color = sys.stdout.isatty() and not args.no_color and not args.json and args.output is None
 
         write_output(
             instructions,
             bytecode,
+            metadata,
             outfile=args.output,
             json_out=args.json,
             summary=args.summary,
             cfg=args.cfg,
+            color=color,
         )
-
         return EXIT_SUCCESS
 
     except ValueError as e:
-
-        LOG.error(
-            "Invalid bytecode: %s",
-            e,
-        )
-
+        LOG.error("Invalid bytecode: %s", e)
         return EXIT_INVALID_BYTECODE
-
     except IOError as e:
-
         LOG.error("%s", e)
-
         return EXIT_READ_ERROR
-
     except RuntimeError as e:
-
         LOG.error("%s", e)
-
         return EXIT_DISASSEMBLY_ERROR
-
     except KeyboardInterrupt:
-
         print("\nInterrupted")
-
         return 130
-
     except Exception:
-
         LOG.exception("Fatal error")
-
         return EXIT_WRITE_ERROR
 
 
