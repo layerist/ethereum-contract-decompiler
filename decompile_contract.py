@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ultra-Hardened EVM Bytecode Disassembler v5
+Ultra-Hardened EVM Bytecode Disassembler v6
 ===========================================
 
 A dependency-light EVM bytecode disassembler and analyzer.
@@ -36,7 +36,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 
 # =============================================================================
@@ -69,7 +69,7 @@ def setup_logging(debug: bool) -> None:
 # Constants
 # =============================================================================
 
-SCRIPT_VERSION = "5.0"
+SCRIPT_VERSION = "6.0"
 HEX_RE = re.compile(r"^[0-9a-f]+$")
 COMMENT_RE = re.compile(r"(//.*?$|#.*?$)", re.MULTILINE)
 MAX_BYTECODE_SIZE = 50_000_000
@@ -197,6 +197,23 @@ class AnalysisSummary:
     entropy: float
     avg_gas: float
     runtime_likely: bool
+    estimated_static_gas: int
+    warning_count: int
+
+
+@dataclass(frozen=True)
+class ControlFlowEdge:
+    source: int
+    target: Optional[int]
+    kind: str
+    resolved: bool
+
+
+@dataclass(frozen=True)
+class AnalysisWarning:
+    pc: Optional[int]
+    code: str
+    message: str
 
 
 # =============================================================================
@@ -334,20 +351,35 @@ def opcode_category(opcode: str) -> str:
     return "other"
 
 
-def extract_function_selectors(bytecode: bytes) -> List[str]:
-    """Extract likely selectors from PUSH4 patterns, avoiding PUSH data false-walk where possible."""
+def extract_function_selectors(instructions: Sequence[Instruction]) -> List[str]:
+    """Extract likely Solidity/Vyper dispatcher selectors.
+
+    A selector is accepted only when PUSH4 is followed shortly by EQ and a
+    conditional branch. This avoids treating constants embedded in ordinary
+    code as ABI selectors.
+    """
     selectors: Set[str] = set()
-    for ins in disassemble_stream(bytecode):
-        if ins.opcode == "PUSH4" and ins.operand:
-            selector = ins.operand[2:]
-            if selector not in {"00000000", "ffffffff", PANIC_SELECTOR}:
-                selectors.add(selector)
+    n = len(instructions)
+    for idx, ins in enumerate(instructions):
+        if ins.opcode != "PUSH4" or not ins.operand or ins.is_push_truncated:
+            continue
+        window = instructions[idx + 1:min(idx + 7, n)]
+        has_eq = any(x.opcode == "EQ" for x in window)
+        has_jumpi = any(x.opcode == "JUMPI" for x in window)
+        if not (has_eq and has_jumpi):
+            continue
+        selector = ins.operand[2:]
+        if selector not in {"00000000", "ffffffff", PANIC_SELECTOR}:
+            selectors.add(selector)
     return sorted(selectors)
 
 
-def detect_runtime_code(bytecode: bytes) -> bool:
-    """Heuristic: runtime bytecode often contains dispatcher/call/return/revert logic."""
-    return any(op in bytecode for op in (b"\x35", b"\x36", b"\xf3", b"\xfd"))
+def detect_runtime_code(instructions: Sequence[Instruction]) -> bool:
+    """Heuristic based on decoded opcodes, never on bytes inside PUSH data."""
+    ops = {ins.opcode for ins in instructions}
+    dispatcher = {"CALLDATALOAD", "CALLDATASIZE", "JUMPI"}.issubset(ops)
+    externally_callable = bool(ops & {"RETURN", "REVERT", "CALL", "DELEGATECALL", "STATICCALL"})
+    return dispatcher or externally_callable
 
 
 def gas_cost(opcode: str) -> int:
@@ -436,16 +468,45 @@ def discover_jumpdests(instructions: Iterable[Instruction]) -> Set[int]:
     return {ins.pc for ins in instructions if ins.is_jumpdest}
 
 
-def static_jump_edges(instructions: List[Instruction], jumpdests: Set[int]) -> List[Tuple[int, int]]:
-    """Conservative edge extraction: only PUSH<N> immediately before JUMP/JUMPI is treated as static."""
-    edges: List[Tuple[int, int]] = []
+def build_cfg_edges(instructions: Sequence[Instruction]) -> List[ControlFlowEdge]:
+    """Build conservative instruction-level control-flow edges.
+
+    Resolves immediate PUSH -> JUMP/JUMPI targets and records fallthrough edges.
+    Dynamic jump targets remain explicit unresolved edges instead of disappearing.
+    """
+    if not instructions:
+        return []
+    jumpdests = discover_jumpdests(instructions)
+    edges: List[ControlFlowEdge] = []
+    terminal = {"STOP", "RETURN", "REVERT", "INVALID", "SELFDESTRUCT"}
+
     for idx, ins in enumerate(instructions):
-        if ins.opcode not in {"JUMP", "JUMPI"} or idx == 0:
-            continue
-        prev_ins = instructions[idx - 1]
-        if prev_ins.jump_target is not None and prev_ins.jump_target in jumpdests:
-            edges.append((ins.pc, prev_ins.jump_target))
+        nxt = instructions[idx + 1].pc if idx + 1 < len(instructions) else None
+        if ins.opcode in {"JUMP", "JUMPI"}:
+            target = instructions[idx - 1].jump_target if idx > 0 else None
+            resolved = target is not None and target in jumpdests
+            edges.append(ControlFlowEdge(ins.pc, target, "jump_true" if ins.opcode == "JUMPI" else "jump", resolved))
+            if ins.opcode == "JUMPI" and nxt is not None:
+                edges.append(ControlFlowEdge(ins.pc, nxt, "fallthrough", True))
+        elif ins.opcode not in terminal and nxt is not None:
+            edges.append(ControlFlowEdge(ins.pc, nxt, "fallthrough", True))
     return edges
+
+
+def collect_warnings(instructions: Sequence[Instruction], edges: Sequence[ControlFlowEdge]) -> List[AnalysisWarning]:
+    warnings: List[AnalysisWarning] = []
+    for ins in instructions:
+        if ins.is_unknown:
+            warnings.append(AnalysisWarning(ins.pc, "UNKNOWN_OPCODE", ins.opcode))
+        if ins.is_invalid:
+            warnings.append(AnalysisWarning(ins.pc, "INVALID_OPCODE", "Explicit INVALID opcode"))
+        if ins.is_push_truncated:
+            warnings.append(AnalysisWarning(ins.pc, "TRUNCATED_PUSH", f"{ins.opcode} has incomplete operand"))
+    for edge in edges:
+        if edge.kind.startswith("jump") and not edge.resolved:
+            msg = "Dynamic jump target" if edge.target is None else f"Target {edge.target} is not a JUMPDEST"
+            warnings.append(AnalysisWarning(edge.source, "UNRESOLVED_JUMP", msg))
+    return warnings
 
 
 # =============================================================================
@@ -454,7 +515,9 @@ def static_jump_edges(instructions: List[Instruction], jumpdests: Set[int]) -> L
 
 def build_summary(instructions: List[Instruction], bytecode: bytes) -> AnalysisSummary:
     gas_values = [i.gas for i in instructions if i.gas >= 0]
-    selectors = extract_function_selectors(bytecode)
+    selectors = extract_function_selectors(instructions)
+    edges = build_cfg_edges(instructions)
+    warnings = collect_warnings(instructions, edges)
     return AnalysisSummary(
         bytecode_size=len(bytecode),
         instruction_count=len(instructions),
@@ -468,9 +531,10 @@ def build_summary(instructions: List[Instruction], bytecode: bytes) -> AnalysisS
         has_panic_selector=PANIC_SELECTOR in {i.operand[2:] for i in instructions if i.opcode == "PUSH4" and i.operand},
         entropy=calculate_entropy(bytecode),
         avg_gas=round(mean(gas_values), 2) if gas_values else 0.0,
-        runtime_likely=detect_runtime_code(bytecode),
+        runtime_likely=detect_runtime_code(instructions),
+        estimated_static_gas=sum(gas_values),
+        warning_count=len(warnings),
     )
-
 
 def opcode_summary(instructions: Iterable[Instruction], *, color: bool) -> str:
     counter = Counter(i.opcode for i in instructions)
@@ -529,14 +593,39 @@ def render_summary(s: AnalysisSummary, *, color: bool) -> List[str]:
         f"  Truncated PUSH:      {s.truncated_push_count}",
         f"  Entropy:             {s.entropy}",
         f"  Avg Gas Approx:      {s.avg_gas}",
+        f"  Static Gas Sum*:     {s.estimated_static_gas}",
         f"  Runtime Likely:      {s.runtime_likely}",
         f"  Panic Selector Seen: {s.has_panic_selector}",
         f"  Selector Count:      {s.selector_count}",
+        f"  Analysis Warnings:   {s.warning_count}",
     ])
     if s.function_selectors:
         lines.append(f"  Function Selectors:  {', '.join(s.function_selectors[:30])}")
         if len(s.function_selectors) > 30:
             lines.append(f"                       ... +{len(s.function_selectors) - 30} more")
+    lines.append("  * Excludes dynamic gas, memory expansion, cold/warm access and refunds.")
+    return lines
+
+
+def render_cfg(edges: Sequence[ControlFlowEdge]) -> List[str]:
+    lines = ["", "Control Flow Edges:"]
+    if not edges:
+        lines.append("  (none)")
+        return lines
+    for edge in edges:
+        target = "dynamic" if edge.target is None else str(edge.target)
+        status = "" if edge.resolved else " [unresolved]"
+        lines.append(f"  {edge.source:06d} -> {target:<8} {edge.kind}{status}")
+    return lines
+
+
+def render_warnings(warnings: Sequence[AnalysisWarning]) -> List[str]:
+    if not warnings:
+        return []
+    lines = ["", "Warnings:"]
+    for w in warnings:
+        location = "global" if w.pc is None else f"pc={w.pc}"
+        lines.append(f"  [{w.code}] {location}: {w.message}")
     return lines
 
 
@@ -552,16 +641,18 @@ def write_output(
     color: bool,
 ) -> None:
     try:
+        edges = build_cfg_edges(instructions)
+        warnings = collect_warnings(instructions, edges)
         if json_out:
-            jumpdests = discover_jumpdests(instructions)
             payload = {
                 "version": SCRIPT_VERSION,
                 "metadata": asdict(metadata),
                 "summary": asdict(build_summary(instructions, bytecode)),
+                "warnings": [asdict(w) for w in warnings],
                 "instructions": [asdict(i) for i in instructions],
             }
             if cfg:
-                payload["cfg_edges"] = static_jump_edges(instructions, jumpdests)
+                payload["cfg_edges"] = [asdict(e) for e in edges]
             text = json.dumps(payload, indent=2, sort_keys=True)
         else:
             lines = [instruction_to_text(i, color=color) for i in instructions]
@@ -571,10 +662,13 @@ def write_output(
                     f"Metadata stripped: offset={metadata.offset} length={metadata.length} "
                     f"original={metadata.original_size}B stripped={metadata.stripped_size}B"
                 )
+            if cfg:
+                lines.extend(render_cfg(edges))
             if summary:
                 lines.append("")
                 lines.append(opcode_summary(instructions, color=color))
                 lines.extend(render_summary(build_summary(instructions, bytecode), color=color))
+                lines.extend(render_warnings(warnings))
             text = "\n".join(lines)
 
         if outfile:
@@ -593,7 +687,8 @@ def write_output(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=f"Ultra-Hardened EVM Bytecode Disassembler v{SCRIPT_VERSION}"
+        description=f"Ultra-Hardened EVM Bytecode Disassembler v{SCRIPT_VERSION}",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--bytecode", help="Raw hex bytecode")
@@ -603,7 +698,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Output file")
     parser.add_argument("--json", action="store_true", help="JSON output")
     parser.add_argument("--summary", action="store_true", help="Show analysis summary")
-    parser.add_argument("--cfg", action="store_true", help="Static CFG edge extraction")
+    parser.add_argument("--cfg", action="store_true", help="Emit conservative CFG edges (text and JSON)")
     parser.add_argument("--pc-start", type=int, help="Start PC filter, inclusive")
     parser.add_argument("--pc-end", type=int, help="End PC filter, inclusive")
     parser.add_argument("--no-metadata", action="store_true", help="Do NOT strip Solidity CBOR metadata")
@@ -632,7 +727,14 @@ def main() -> int:
         if metadata.stripped:
             LOG.info("Stripped CBOR metadata: %d -> %d bytes", metadata.original_size, metadata.stripped_size)
 
-        instructions = disassemble(bytecode, pc_start=args.pc_start, pc_end=args.pc_end)
+        all_instructions = disassemble(bytecode, pc_start=None, pc_end=None)
+        instructions = [
+            ins for ins in all_instructions
+            if (args.pc_start is None or ins.pc >= args.pc_start)
+            and (args.pc_end is None or ins.pc <= args.pc_end)
+        ]
+        if not instructions:
+            raise RuntimeError("No instructions decoded in the selected PC range")
         color = sys.stdout.isatty() and not args.no_color and not args.json and args.output is None
 
         write_output(
