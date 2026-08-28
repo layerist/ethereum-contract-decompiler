@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EVM Disassembler Pro v7.0
+EVM Disassembler Pro v8.0
 =========================
 
 A hardened, dependency‑free EVM bytecode disassembler and static analyzer.
@@ -42,7 +42,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set,
 # Constants & configuration
 # -----------------------------------------------------------------------------
 
-VERSION = "7.0"
+VERSION = "8.0"
 MAX_BYTECODE_SIZE = 50_000_000
 PANIC_SELECTOR = "4e487b71"
 HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
@@ -104,6 +104,7 @@ OPCODES: Dict[int, str] = {
     0x1B: "SHL",
     0x1C: "SHR",
     0x1D: "SAR",
+    0x1E: "CLZ",
     0x20: "SHA3",
     0x30: "ADDRESS",
     0x31: "BALANCE",
@@ -202,6 +203,7 @@ GAS_FALLBACK: Dict[str, int] = {
     "SHL": 3,
     "SHR": 3,
     "SAR": 3,
+    "CLZ": 5,
     "SHA3": 30,
     "ADDRESS": 2,
     "BALANCE": 100,  # cold access in practice, but static
@@ -294,6 +296,7 @@ LOGIC_OPS = {
     "SHL",
     "SHR",
     "SAR",
+    "CLZ",
 }
 CONTROL_FLOW_OPS = {
     "JUMP",
@@ -406,6 +409,9 @@ class AnalysisSummary:
     avg_gas: float
     runtime_likely: bool
     creation_likely: bool
+    code_kind: str
+    runtime_score: int
+    creation_score: int
     estimated_static_gas: int
     warning_count: int
 
@@ -481,8 +487,10 @@ def strip_metadata_cbor(bytecode: bytes) -> Tuple[bytes, MetadataInfo]:
     if start < 0:
         return bytecode, no_strip
 
-    # CBOR map start byte (major type 5, additional info 1..15)
-    if 0xA1 <= bytecode[start] <= 0xAF:
+    # CBOR major type 5 (map). This accepts compact and extended map headers
+    # (0xA0..0xBB) as well as the indefinite-length map marker (0xBF).
+    first = bytecode[start]
+    if ((first & 0xE0) == 0xA0 and (first & 0x1F) <= 27) or first == 0xBF:
         stripped = bytecode[:start]
         LOG.debug("Detected CBOR metadata at offset=%d length=%d", start, meta_len)
         return stripped, MetadataInfo(original_size, len(stripped), True, start, meta_len)
@@ -637,62 +645,120 @@ class Disassembler:
 # -----------------------------------------------------------------------------
 
 def extract_function_selectors(instructions: Sequence[Instruction]) -> List[str]:
+    """Extract likely ABI selectors from a Solidity/Vyper-style dispatcher.
+
+    The old implementation accepted any PUSH4 that merely had EQ and JUMPI
+    somewhere in a six-instruction window. That was useful for recall but
+    produced false positives in constants and error-handling code. Here we
+    require a tighter comparator pattern and evidence of calldata dispatch.
     """
-    Extract likely ABI function selectors.
-    A selector is considered valid if a PUSH4 is followed by EQ and a JUMPI
-    within the next few instructions.
-    """
+    if not instructions:
+        return []
+
+    # A normal ABI dispatcher reads calldata early. Keep the scan bounded so a
+    # CALLDATALOAD deep inside a function does not validate unrelated PUSH4s.
+    early = instructions[: min(160, len(instructions))]
+    if not any(i.opcode == "CALLDATALOAD" for i in early):
+        return []
+
     selectors: Set[str] = set()
     n = len(instructions)
     for idx, ins in enumerate(instructions):
         if ins.opcode != "PUSH4" or not ins.operand or ins.is_push_truncated:
             continue
-        window = instructions[idx + 1 : min(idx + 7, n)]
-        has_eq = any(x.opcode == "EQ" for x in window)
-        has_jumpi = any(x.opcode == "JUMPI" for x in window)
-        if not (has_eq and has_jumpi):
+
+        # Typical forms include:
+        #   DUP1 PUSH4 <sel> EQ PUSH2 <dst> JUMPI
+        # and minor compiler variations with DUP/SWAP/PUSH between EQ/JUMPI.
+        eq_idx: Optional[int] = None
+        for j in range(idx + 1, min(idx + 4, n)):
+            if instructions[j].opcode == "EQ":
+                eq_idx = j
+                break
+            if instructions[j].opcode in CONTROL_FLOW_OPS:
+                break
+        if eq_idx is None:
             continue
+
+        jumpi_idx: Optional[int] = None
+        for j in range(eq_idx + 1, min(eq_idx + 6, n)):
+            if instructions[j].opcode == "JUMPI":
+                jumpi_idx = j
+                break
+            if instructions[j].opcode in {"JUMP", "STOP", "RETURN", "REVERT", "INVALID", "SELFDESTRUCT"}:
+                break
+        if jumpi_idx is None:
+            continue
+
         selector = ins.operand[2:]
         if selector not in {"00000000", "ffffffff", PANIC_SELECTOR}:
             selectors.add(selector)
     return sorted(selectors)
 
 
-def detect_runtime_code(instructions: Sequence[Instruction]) -> bool:
-    """Heuristic: runtime code typically has CALLDATALOAD, CALLDATASIZE, etc."""
+def classify_code(instructions: Sequence[Instruction]) -> Tuple[str, int, int]:
+    """Return (kind, runtime_score, creation_score) using independent signals.
+
+    `RETURN` alone is deliberately *not* treated as a runtime signal: initcode
+    normally ends by RETURNing the deployed runtime bytecode. This fixes the
+    circular heuristic in v7 where creation detection was often suppressed by
+    runtime detection itself.
+    """
+    if not instructions:
+        return "unknown", 0, 0
+
     ops = {ins.opcode for ins in instructions}
-    dispatcher = {"CALLDATALOAD", "CALLDATASIZE", "JUMPI"}.issubset(ops)
-    externally_callable = bool(ops & {"RETURN", "REVERT", "CALL", "DELEGATECALL", "STATICCALL"})
-    return dispatcher or externally_callable
+    head = instructions[: min(180, len(instructions))]
+    head_ops = {ins.opcode for ins in head}
+    runtime_score = 0
+    creation_score = 0
+
+    # Strong runtime/ABI-dispatch evidence.
+    if "CALLDATALOAD" in head_ops:
+        runtime_score += 4
+    if "CALLDATASIZE" in head_ops:
+        runtime_score += 2
+    if "CALLVALUE" in head_ops:
+        runtime_score += 1
+    if "JUMPI" in head_ops and "CALLDATALOAD" in head_ops:
+        runtime_score += 2
+    if extract_function_selectors(instructions):
+        runtime_score += 3
+    if ops & {"SLOAD", "SSTORE", "LOG0", "LOG1", "LOG2", "LOG3", "LOG4", "DELEGATECALL", "STATICCALL"}:
+        runtime_score += 1
+
+    # Initcode commonly copies an embedded runtime image and RETURNs it.
+    if "CODECOPY" in ops:
+        creation_score += 4
+    if "CODECOPY" in ops and "RETURN" in ops:
+        creation_score += 3
+    if len(instructions) >= 3:
+        prologue = [i.opcode for i in instructions[:3]]
+        if prologue == ["PUSH1", "PUSH1", "MSTORE"]:
+            # Shared by much Solidity code, so only weak evidence.
+            creation_score += 1
+    if "CALLDATALOAD" not in head_ops and "CODECOPY" in ops:
+        creation_score += 2
+
+    if max(runtime_score, creation_score) < 2:
+        kind = "unknown"
+    elif runtime_score >= creation_score + 2:
+        kind = "runtime"
+    elif creation_score >= runtime_score + 2:
+        kind = "creation"
+    else:
+        kind = "ambiguous"
+    return kind, runtime_score, creation_score
+
+
+def detect_runtime_code(instructions: Sequence[Instruction]) -> bool:
+    kind, runtime_score, creation_score = classify_code(instructions)
+    return kind == "runtime" or (kind == "ambiguous" and runtime_score > creation_score)
 
 
 def detect_creation_code(instructions: Sequence[Instruction]) -> bool:
-    """
-    Heuristic: creation code often contains CODECOPY, RETURNDATASIZE, etc.
-    Also, the presence of a top‑level dispatcher (CALLDATALOAD...) is more common in runtime.
-    """
-    # If runtime‑like patterns are absent, but we have a lot of PUSH and MSTORE, it might be init.
-    # More refined: check for typical init pattern: PUSH1 0x60, PUSH1 0x40, MSTORE, then PUSH1 <size>, PUSH1 <offset>, PUSH1 0x00, CODECOPY, etc.
-    # We'll use a simpler heuristic: runtime likely if it has a dispatcher; otherwise creation.
-    ops = {ins.opcode for ins in instructions}
-    has_codecopy = "CODECOPY" in ops
-    has_return = "RETURN" in ops
-    has_selfdestruct = "SELFDESTRUCT" in ops
-    # If there's a RETURN and no dispatcher, it might be creation.
-    if has_return and not detect_runtime_code(instructions):
-        return True
-    # If there's CODECOPY and no dispatcher, it's often creation.
-    if has_codecopy and not detect_runtime_code(instructions):
-        return True
-    # If there is SELFDESTRUCT, it's likely runtime (or flawed creation).
-    if has_selfdestruct:
-        return False
-    # Fallback: if the first instruction is PUSH (like 0x60), it's often creation.
-    if instructions and instructions[0].opcode.startswith("PUSH"):
-        # Many creation contracts start with PUSH1 0x60
-        if instructions[0].opcode == "PUSH1" and instructions[0].operand == "0x60":
-            return True
-    return False
+    kind, runtime_score, creation_score = classify_code(instructions)
+    return kind == "creation" or (kind == "ambiguous" and creation_score > runtime_score)
 
 
 def calculate_entropy(data: bytes) -> float:
@@ -711,12 +777,26 @@ def discover_jumpdests(instructions: Sequence[Instruction]) -> Set[int]:
     return {ins.pc for ins in instructions if ins.is_jumpdest}
 
 
+def _immediate_jump_target(instructions: Sequence[Instruction], idx: int) -> Optional[int]:
+    """Resolve only a provably immediate PUSH-based jump target.
+
+    This intentionally stays conservative. A previous v7 implementation also
+    used the previous instruction, but without explicitly requiring PUSH, which
+    could accidentally reuse a non-jump constant. Dynamic stack-derived jumps
+    remain unresolved rather than being guessed.
+    """
+    if idx <= 0:
+        return None
+    prev = instructions[idx - 1]
+    if not prev.opcode.startswith("PUSH") or prev.opcode == "PUSH0":
+        return None
+    if prev.is_push_truncated:
+        return None
+    return prev.jump_target
+
+
 def build_cfg_edges(instructions: Sequence[Instruction]) -> List[ControlFlowEdge]:
-    """
-    Conservative instruction‑level CFG.
-    Resolves immediate jumps when the target is a known JUMPDEST.
-    Unresolved jumps are recorded as dynamic edges.
-    """
+    """Build a conservative instruction-level CFG for legacy EVM bytecode."""
     if not instructions:
         return []
     jumpdests = discover_jumpdests(instructions)
@@ -726,8 +806,7 @@ def build_cfg_edges(instructions: Sequence[Instruction]) -> List[ControlFlowEdge
     for idx, ins in enumerate(instructions):
         nxt = instructions[idx + 1].pc if idx + 1 < len(instructions) else None
         if ins.opcode in {"JUMP", "JUMPI"}:
-            # The operand of a JUMP/JUMPI is usually the previous PUSH instruction.
-            target = instructions[idx - 1].jump_target if idx > 0 else None
+            target = _immediate_jump_target(instructions, idx)
             resolved = target is not None and target in jumpdests
             kind = "jump_true" if ins.opcode == "JUMPI" else "jump"
             edges.append(ControlFlowEdge(ins.pc, target, kind, resolved))
@@ -751,15 +830,24 @@ def collect_warnings(
             warnings.append(
                 AnalysisWarning(ins.pc, "TRUNCATED_PUSH", f"{ins.opcode} has incomplete operand")
             )
+
+    unresolved_jump_exists = False
     for edge in edges:
         if edge.kind.startswith("jump") and not edge.resolved:
+            unresolved_jump_exists = True
             msg = "Dynamic jump target" if edge.target is None else f"Target {edge.target} is not a JUMPDEST"
             warnings.append(AnalysisWarning(edge.source, "UNRESOLVED_JUMP", msg))
-    # Additional: detect JUMPDESTs that are never targeted (unreachable)
-    targeted = {e.target for e in edges if e.resolved and e.target is not None}
-    for ins in instructions:
-        if ins.is_jumpdest and ins.pc not in targeted:
-            warnings.append(AnalysisWarning(ins.pc, "UNREACHABLE_JUMPDEST", "No incoming jump edge"))
+
+    # Do not label untargeted JUMPDESTs unreachable while dynamic jumps exist:
+    # a dynamic edge may legitimately point to any of them.
+    if not unresolved_jump_exists:
+        targeted = {e.target for e in edges if e.resolved and e.target is not None}
+        entry_pc = instructions[0].pc if instructions else None
+        for ins in instructions:
+            if ins.is_jumpdest and ins.pc != entry_pc and ins.pc not in targeted:
+                warnings.append(
+                    AnalysisWarning(ins.pc, "UNTARGETED_JUMPDEST", "No statically resolved incoming jump edge")
+                )
     return warnings
 
 
@@ -787,6 +875,7 @@ class Analyzer:
     def summary(self) -> AnalysisSummary:
         gas_values = [i.gas for i in self.instructions if i.gas >= 0]
         selectors = extract_function_selectors(self.instructions)
+        code_kind, runtime_score, creation_score = classify_code(self.instructions)
         runtime = detect_runtime_code(self.instructions)
         creation = detect_creation_code(self.instructions)
 
@@ -806,6 +895,9 @@ class Analyzer:
             avg_gas=round(mean(gas_values), 2) if gas_values else 0.0,
             runtime_likely=runtime,
             creation_likely=creation,
+            code_kind=code_kind,
+            runtime_score=runtime_score,
+            creation_score=creation_score,
             estimated_static_gas=sum(gas_values),
             warning_count=len(self.warnings),
         )
@@ -880,11 +972,12 @@ class Formatter:
         show_summary: bool,
         show_cfg: bool,
         show_warnings: bool,
+        show_instructions: bool = True,
         filter_category: Optional[str] = None,
         search_hex: Optional[str] = None,
     ) -> str:
         lines = []
-        for ins in self.instructions:
+        for ins in self.instructions if show_instructions else ():
             if filter_category and ins.category != filter_category:
                 continue
             if search_hex and search_hex.lower() not in ins.raw.lower():
@@ -936,6 +1029,7 @@ class Formatter:
                 f"  Static Gas Sum*:     {s.estimated_static_gas}",
                 f"  Runtime Likely:      {s.runtime_likely}",
                 f"  Creation Likely:     {s.creation_likely}",
+                f"  Code Classification: {s.code_kind} (runtime={s.runtime_score}, creation={s.creation_score})",
                 f"  Panic Selector Seen: {s.has_panic_selector}",
                 f"  Selector Count:      {s.selector_count}",
                 f"  Analysis Warnings:   {s.warning_count}",
@@ -996,6 +1090,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Output file")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument("--summary", action="store_true", help="Show analysis summary (enables opcode stats)")
+    parser.add_argument("--summary-only", action="store_true", help="Show summary/opcode stats without instruction listing")
     parser.add_argument("--cfg", action="store_true", help="Emit conservative CFG edges (text and JSON)")
     parser.add_argument("--warnings", action="store_true", help="Show analysis warnings")
     parser.add_argument("--pc-start", type=int, help="Start PC filter, inclusive")
@@ -1033,6 +1128,14 @@ def main() -> int:
     setup_logging(args.debug)
 
     try:
+        if args.summary_only and (args.category or args.search):
+            raise ValueError("--summary-only cannot be combined with --category/--search")
+        if args.search:
+            search = strip_0x(re.sub(r"\s+", "", args.search)).lower()
+            if not search or not HEX_RE.fullmatch(search):
+                raise ValueError("--search must be a hexadecimal substring")
+            args.search = search
+
         # 1. Load bytecode
         if args.bytecode:
             bytecode, metadata = normalize_bytecode(args.bytecode, remove_metadata=not args.no_metadata)
@@ -1045,8 +1148,15 @@ def main() -> int:
         if metadata.stripped:
             LOG.info("Stripped CBOR metadata: %d -> %d bytes", metadata.original_size, metadata.stripped_size)
 
-        # 2. Disassemble
+        # 2. Disassemble once. Analysis always runs on the complete decoded
+        #    bytecode; PC filters affect presentation only. This avoids bogus
+        #    selector/CFG/classification results for sliced output ranges.
         disassembler = Disassembler(bytecode)
+        full_instructions = disassembler.disassemble()
+        if not full_instructions:
+            LOG.error("No instructions decoded")
+            return EXIT_DISASSEMBLY_ERROR
+
         try:
             instructions = disassembler.disassemble(pc_start=args.pc_start, pc_end=args.pc_end)
         except ValueError as e:
@@ -1057,12 +1167,16 @@ def main() -> int:
             LOG.error("No instructions in the selected PC range")
             return EXIT_DISASSEMBLY_ERROR
 
-        # 3. Analyze
-        analyzer = Analyzer(instructions, bytecode)
+        # 3. Analyze full code, display the selected range.
+        analyzer = Analyzer(full_instructions, bytecode)
 
         # 4. Handle special --detect-creation
         if args.detect_creation:
-            print("Runtime code likely:" if analyzer.summary().runtime_likely else "Creation code likely")
+            summary = analyzer.summary()
+            print(
+                f"Code classification: {summary.code_kind} "
+                f"(runtime_score={summary.runtime_score}, creation_score={summary.creation_score})"
+            )
             return EXIT_SUCCESS
 
         # 5. Format output
@@ -1080,8 +1194,9 @@ def main() -> int:
             text = formatter.json_output(include_cfg=args.cfg)
         else:
             text = formatter.text_output(
-                show_summary=args.summary,
+                show_summary=args.summary or args.summary_only,
                 show_cfg=args.cfg,
+                show_instructions=not args.summary_only,
                 show_warnings=args.warnings,
                 filter_category=args.category,
                 search_hex=args.search,
@@ -1105,8 +1220,11 @@ def main() -> int:
     except RuntimeError as e:
         LOG.error("%s", e)
         return EXIT_DISASSEMBLY_ERROR
+    except BrokenPipeError:
+        # Typical when piping into `head`; avoid a noisy traceback.
+        return EXIT_SUCCESS
     except KeyboardInterrupt:
-        print("\nInterrupted")
+        print("\nInterrupted", file=sys.stderr)
         return 130
     except Exception:
         LOG.exception("Fatal error")
