@@ -27,7 +27,10 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import tempfile
 import logging
 import math
 import re
@@ -42,7 +45,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set,
 # Constants & configuration
 # -----------------------------------------------------------------------------
 
-VERSION = "8.0"
+VERSION = "9.0"
 MAX_BYTECODE_SIZE = 50_000_000
 PANIC_SELECTOR = "4e487b71"
 HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
@@ -414,6 +417,8 @@ class AnalysisSummary:
     creation_score: int
     estimated_static_gas: int
     warning_count: int
+    sha256: str
+    category_counts: Dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -900,6 +905,8 @@ class Analyzer:
             creation_score=creation_score,
             estimated_static_gas=sum(gas_values),
             warning_count=len(self.warnings),
+            sha256=hashlib.sha256(self.bytecode).hexdigest(),
+            category_counts=dict(sorted(Counter(i.category for i in self.instructions).items())),
         )
 
     def opcode_counter(self) -> Counter:
@@ -1033,6 +1040,8 @@ class Formatter:
                 f"  Panic Selector Seen: {s.has_panic_selector}",
                 f"  Selector Count:      {s.selector_count}",
                 f"  Analysis Warnings:   {s.warning_count}",
+                f"  SHA-256:             {s.sha256}",
+                f"  Categories:          {', '.join(f'{k}={v}' for k, v in s.category_counts.items())}",
             ]
         )
         if s.function_selectors:
@@ -1070,7 +1079,43 @@ class Formatter:
         }
         if include_cfg:
             payload["cfg_edges"] = [asdict(e) for e in self.analyzer.edges]
-        return json.dumps(payload, indent=2, sort_keys=True)
+        return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+# -----------------------------------------------------------------------------
+# Safe output writing
+# -----------------------------------------------------------------------------
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace *path* with UTF-8 text when possible.
+
+    The temporary file is created in the destination directory so os.replace()
+    remains atomic on normal local filesystems. Permissions of an existing
+    destination are preserved on a best-effort basis.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old_mode = None
+    try:
+        old_mode = path.stat().st_mode & 0o7777
+    except FileNotFoundError:
+        pass
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if old_mode is not None:
+            os.chmod(tmp, old_mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 # -----------------------------------------------------------------------------
@@ -1130,6 +1175,12 @@ def main() -> int:
     try:
         if args.summary_only and (args.category or args.search):
             raise ValueError("--summary-only cannot be combined with --category/--search")
+        if args.pc_start is not None and args.pc_start < 0:
+            raise ValueError("--pc-start must be >= 0")
+        if args.pc_end is not None and args.pc_end < 0:
+            raise ValueError("--pc-end must be >= 0")
+        if args.pc_start is not None and args.pc_end is not None and args.pc_start > args.pc_end:
+            raise ValueError("--pc-start must be <= --pc-end")
         if args.search:
             search = strip_0x(re.sub(r"\s+", "", args.search)).lower()
             if not search or not HEX_RE.fullmatch(search):
@@ -1203,8 +1254,7 @@ def main() -> int:
             )
 
         if args.output:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(text + ("\n" if text else ""), encoding="utf-8")
+            atomic_write_text(args.output, text + ("\n" if text else ""))
             LOG.info("Saved output to %s", args.output)
         else:
             print(text)
