@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EVM Disassembler Pro v8.0
+EVM Disassembler Pro v9.1
 =========================
 
 A hardened, dependency‑free EVM bytecode disassembler and static analyzer.
@@ -35,17 +35,16 @@ import logging
 import math
 import re
 import sys
-from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from statistics import mean
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 # -----------------------------------------------------------------------------
 # Constants & configuration
 # -----------------------------------------------------------------------------
 
-VERSION = "9.0"
+VERSION = "9.1"
 MAX_BYTECODE_SIZE = 50_000_000
 PANIC_SELECTOR = "4e487b71"
 HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
@@ -58,7 +57,6 @@ GREEN = "\033[92m"
 YELLOW = "\033[93m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
-MAGENTA = "\033[95m"
 
 # -----------------------------------------------------------------------------
 # Logging setup
@@ -252,12 +250,12 @@ GAS_FALLBACK: Dict[str, int] = {
     "MCOPY": 3,  # base cost, additional per word
     "PUSH0": 2,
     "CREATE": 32000,
-    "CALL": 700,  # base, additional for value/access
-    "CALLCODE": 700,
+    "CALL": 100,  # warm-account baseline; cold access/value cost excluded
+    "CALLCODE": 100,
     "RETURN": 0,
-    "DELEGATECALL": 700,
+    "DELEGATECALL": 100,
     "CREATE2": 32000,
-    "STATICCALL": 700,
+    "STATICCALL": 100,
     "REVERT": 0,
     "INVALID": 0,
     "SELFDESTRUCT": 5000,
@@ -268,7 +266,7 @@ for n in range(1, 17):
     GAS_FALLBACK[f"DUP{n}"] = 3
     GAS_FALLBACK[f"SWAP{n}"] = 3
 for n in range(5):
-    GAS_FALLBACK[f"LOG{n}"] = 375
+    GAS_FALLBACK[f"LOG{n}"] = 375 * (n + 1)  # base + topic costs; data excluded
 
 # Opcode categories
 ARITHMETIC_OPS = {
@@ -304,6 +302,7 @@ LOGIC_OPS = {
 CONTROL_FLOW_OPS = {
     "JUMP",
     "JUMPI",
+    "JUMPDEST",
     "STOP",
     "RETURN",
     "REVERT",
@@ -472,35 +471,145 @@ def validate_hex(body: str) -> None:
 # Metadata stripping
 # -----------------------------------------------------------------------------
 
+# The Solidity/Vyper CBOR suffix is a map, not just a byte beginning with 0xaN.
+# Require a well-formed map containing a known metadata key before stripping it.
+_METADATA_KEYS = frozenset({
+    "solc", "ipfs", "bzzr0", "bzzr1", "experimental", "vyper", "metadata"
+})
+
+
+def _read_cbor_item(data: bytes, pos: int, depth: int = 0) -> Tuple[int, Optional[str]]:
+    """Skip one CBOR item, returning (end offset, text value if a text string).
+
+    Bounds and depth checks prevent malformed metadata from causing excessive
+    recursion or unbounded iteration. No external CBOR dependency is needed.
+    """
+    if depth >= 32 or pos >= len(data):
+        raise ValueError("Truncated or excessively nested CBOR data")
+
+    initial = data[pos]
+    pos += 1
+    major, info = initial >> 5, initial & 31
+    if info < 24:
+        length = info
+    elif info in (24, 25, 26, 27):
+        count = 1 << (info - 24)  # 1, 2, 4, or 8 bytes
+        if pos + count > len(data):
+            raise ValueError("Truncated CBOR length")
+        length = int.from_bytes(data[pos:pos + count], "big")
+        pos += count
+    elif info == 31 and major in (2, 3, 4, 5):
+        length = None
+    else:
+        raise ValueError("Unsupported or invalid CBOR item")
+
+    if major in (0, 1, 7):
+        if major == 7 and info == 31:
+            raise ValueError("Unexpected CBOR break")
+        return pos, None
+
+    if major in (2, 3):
+        if length is None:
+            parts = []
+            while pos < len(data) and data[pos] != 0xff:
+                # An indefinite-length string consists of definite chunks.
+                chunk_type = data[pos] >> 5
+                if chunk_type != major or (data[pos] & 31) == 31:
+                    raise ValueError("Invalid CBOR string chunk")
+                end, text = _read_cbor_item(data, pos, depth + 1)
+                if major == 3:
+                    parts.append(text)
+                pos = end
+            if pos >= len(data):
+                raise ValueError("Unterminated CBOR string")
+            return pos + 1, "".join(parts) if major == 3 else None
+        if length > len(data) - pos:
+            raise ValueError("Truncated CBOR string")
+        end = pos + length
+        if major == 3:
+            return end, data[pos:end].decode("utf-8")
+        return end, None
+
+    if major == 6:
+        return _read_cbor_item(data, pos, depth + 1)
+
+    # Arrays and maps; indefinite collections terminate with a break (0xff).
+    if length is not None and length > (len(data) - pos) // (2 if major == 5 else 1):
+        raise ValueError("Impossible CBOR collection size")
+    count = 0
+    while True:
+        if length is None:
+            if pos >= len(data):
+                raise ValueError("Unterminated CBOR collection")
+            if data[pos] == 0xff:
+                return pos + 1, None
+        elif count >= length:
+            return pos, None
+        pos, _ = _read_cbor_item(data, pos, depth + 1)
+        if major == 5:
+            pos, _ = _read_cbor_item(data, pos, depth + 1)
+        count += 1
+
+
+def _looks_like_compiler_metadata(data: bytes) -> bool:
+    """Validate the trailing CBOR map and identify a compiler metadata key."""
+    if not data or data[0] >> 5 != 5:
+        return False
+    try:
+        first = data[0] & 31
+        if first < 24:
+            pairs, pos = first, 1
+        elif first in (24, 25, 26, 27):
+            width = 1 << (first - 24)
+            if len(data) < 1 + width:
+                return False
+            pairs = int.from_bytes(data[1:1 + width], "big")
+            pos = 1 + width
+        elif first == 31:
+            pairs, pos = None, 1
+        else:
+            return False
+
+        if pairs is not None and pairs > (len(data) - pos) // 2:
+            return False
+        found_key = False
+        count = 0
+        while True:
+            if pairs is None:
+                if pos >= len(data):
+                    return False
+                if data[pos] == 0xff:
+                    return found_key and pos + 1 == len(data)
+            elif count >= pairs:
+                return found_key and pos == len(data)
+            pos, key = _read_cbor_item(data, pos)
+            pos, _ = _read_cbor_item(data, pos)
+            if key in _METADATA_KEYS:
+                found_key = True
+            count += 1
+    except (ValueError, UnicodeError, RecursionError):
+        return False
+
+
 def strip_metadata_cbor(bytecode: bytes) -> Tuple[bytes, MetadataInfo]:
-    """
-    Strip Solidity‑style trailing CBOR metadata.
-    Uses the length encoded in the last two bytes and a heuristic check
-    that the metadata begins with a CBOR map (0xA1–0xAF).
-    """
+    """Strip a valid Solidity/Vyper-style trailing CBOR metadata suffix."""
     original_size = len(bytecode)
     no_strip = MetadataInfo(original_size, original_size, False, None, None)
 
-    if len(bytecode) < 4:
+    if original_size < 4:
         return bytecode, no_strip
 
     meta_len = int.from_bytes(bytecode[-2:], "big")
-    if meta_len <= 0 or meta_len + 2 > len(bytecode):
+    if not 0 < meta_len <= original_size - 2:
         return bytecode, no_strip
 
-    start = len(bytecode) - meta_len - 2
-    if start < 0:
+    start = original_size - meta_len - 2
+    if not _looks_like_compiler_metadata(bytecode[start:-2]):
         return bytecode, no_strip
 
-    # CBOR major type 5 (map). This accepts compact and extended map headers
-    # (0xA0..0xBB) as well as the indefinite-length map marker (0xBF).
-    first = bytecode[start]
-    if ((first & 0xE0) == 0xA0 and (first & 0x1F) <= 27) or first == 0xBF:
-        stripped = bytecode[:start]
-        LOG.debug("Detected CBOR metadata at offset=%d length=%d", start, meta_len)
-        return stripped, MetadataInfo(original_size, len(stripped), True, start, meta_len)
-
-    return bytecode, no_strip
+    stripped = bytecode[:start]
+    LOG.debug("Detected CBOR metadata at offset=%d length=%d", start, meta_len)
+    return stripped, MetadataInfo(original_size, start, True, start, meta_len)
 
 
 def normalize_bytecode(raw: str, *, remove_metadata: bool) -> Tuple[bytes, MetadataInfo]:
@@ -522,8 +631,8 @@ def normalize_bytecode(raw: str, *, remove_metadata: bool) -> Tuple[bytes, Metad
 def load_from_file(path: Path, *, remove_metadata: bool) -> Tuple[bytes, MetadataInfo]:
     try:
         raw = path.read_text(encoding="utf-8")
-    except Exception as e:
-        raise IOError(f"Failed reading file {path}: {e}") from e
+    except (OSError, UnicodeError) as exc:
+        raise OSError(f"Failed reading file {path}: {exc}") from exc
     return normalize_bytecode(raw, remove_metadata=remove_metadata)
 
 
@@ -573,20 +682,19 @@ def disassemble_stream(bytecode: bytes) -> Iterator[Instruction]:
     """
     Lazy instruction generator. Each instruction is yielded as it is decoded.
     """
-    mv = memoryview(bytecode)
     pc = 0
     length = len(bytecode)
 
     while pc < length:
-        byte_value = mv[pc]
+        byte_value = bytecode[pc]
         opcode, is_unknown = decode_opcode(byte_value)
         operand_len = push_length(opcode)
-        available_operand_len = max(0, min(operand_len, length - pc - 1))
-        operand_bytes = bytes(mv[pc + 1 : pc + 1 + available_operand_len])
+        available_operand_len = min(operand_len, length - pc - 1)
+        operand_bytes = bytecode[pc + 1 : pc + 1 + available_operand_len]
         size = 1 + available_operand_len
         is_push_truncated = available_operand_len < operand_len
         operand_hex = f"0x{operand_bytes.hex()}" if operand_len else None
-        raw = bytes(mv[pc : pc + size]).hex()
+        raw = bytecode[pc : pc + size].hex()
         target = (
             int.from_bytes(operand_bytes, "big")
             if operand_len and not is_push_truncated
@@ -623,19 +731,19 @@ class Disassembler:
     ) -> List[Instruction]:
         """
         Return all instructions, optionally filtered by PC range.
-        Results are cached; subsequent calls with the same filters reuse the list.
+        Decoding is cached; filtered calls reuse the decoded instructions.
         """
-        if self._instructions is None:
-            self._instructions = list(disassemble_stream(self.bytecode))
-        if pc_start is None and pc_end is None:
-            return self._instructions
-
         if pc_start is not None and pc_start < 0:
             raise ValueError("--pc-start must be >= 0")
         if pc_end is not None and pc_end < 0:
             raise ValueError("--pc-end must be >= 0")
         if pc_start is not None and pc_end is not None and pc_start > pc_end:
             raise ValueError("--pc-start must be <= --pc-end")
+
+        if self._instructions is None:
+            self._instructions = list(disassemble_stream(self.bytecode))
+        if pc_start is None and pc_end is None:
+            return self._instructions
 
         return [
             ins
@@ -701,7 +809,9 @@ def extract_function_selectors(instructions: Sequence[Instruction]) -> List[str]
     return sorted(selectors)
 
 
-def classify_code(instructions: Sequence[Instruction]) -> Tuple[str, int, int]:
+def classify_code(
+    instructions: Sequence[Instruction], selectors: Optional[Sequence[str]] = None
+) -> Tuple[str, int, int]:
     """Return (kind, runtime_score, creation_score) using independent signals.
 
     `RETURN` alone is deliberately *not* treated as a runtime signal: initcode
@@ -727,7 +837,9 @@ def classify_code(instructions: Sequence[Instruction]) -> Tuple[str, int, int]:
         runtime_score += 1
     if "JUMPI" in head_ops and "CALLDATALOAD" in head_ops:
         runtime_score += 2
-    if extract_function_selectors(instructions):
+    if selectors is None:
+        selectors = extract_function_selectors(instructions)
+    if selectors:
         runtime_score += 3
     if ops & {"SLOAD", "SSTORE", "LOG0", "LOG1", "LOG2", "LOG3", "LOG4", "DELEGATECALL", "STATICCALL"}:
         runtime_score += 1
@@ -817,7 +929,7 @@ def build_cfg_edges(instructions: Sequence[Instruction]) -> List[ControlFlowEdge
             edges.append(ControlFlowEdge(ins.pc, target, kind, resolved))
             if ins.opcode == "JUMPI" and nxt is not None:
                 edges.append(ControlFlowEdge(ins.pc, nxt, "fallthrough", True))
-        elif ins.opcode not in terminal and nxt is not None:
+        elif ins.opcode not in terminal and not ins.is_unknown and nxt is not None:
             edges.append(ControlFlowEdge(ins.pc, nxt, "fallthrough", True))
     return edges
 
@@ -864,6 +976,7 @@ class Analyzer:
         self.bytecode = bytecode
         self._edges: Optional[List[ControlFlowEdge]] = None
         self._warnings: Optional[List[AnalysisWarning]] = None
+        self._summary: Optional[AnalysisSummary] = None
 
     @property
     def edges(self) -> List[ControlFlowEdge]:
@@ -878,13 +991,20 @@ class Analyzer:
         return self._warnings
 
     def summary(self) -> AnalysisSummary:
-        gas_values = [i.gas for i in self.instructions if i.gas >= 0]
-        selectors = extract_function_selectors(self.instructions)
-        code_kind, runtime_score, creation_score = classify_code(self.instructions)
-        runtime = detect_runtime_code(self.instructions)
-        creation = detect_creation_code(self.instructions)
+        if self._summary is not None:
+            return self._summary
 
-        return AnalysisSummary(
+        gas_total = gas_count = 0
+        for ins in self.instructions:
+            if ins.gas >= 0:
+                gas_total += ins.gas
+                gas_count += 1
+        selectors = extract_function_selectors(self.instructions)
+        code_kind, runtime_score, creation_score = classify_code(self.instructions, selectors)
+        runtime = code_kind == "runtime" or (code_kind == "ambiguous" and runtime_score > creation_score)
+        creation = code_kind == "creation" or (code_kind == "ambiguous" and creation_score > runtime_score)
+
+        self._summary = AnalysisSummary(
             bytecode_size=len(self.bytecode),
             instruction_count=len(self.instructions),
             unique_opcodes=len({i.opcode for i in self.instructions}),
@@ -894,20 +1014,23 @@ class Analyzer:
             truncated_push_count=sum(1 for i in self.instructions if i.is_push_truncated),
             function_selectors=selectors,
             selector_count=len(selectors),
-            has_panic_selector=PANIC_SELECTOR
-            in {i.operand[2:] for i in self.instructions if i.opcode == "PUSH4" and i.operand},
+            has_panic_selector=any(
+                i.opcode == "PUSH4" and i.operand == f"0x{PANIC_SELECTOR}"
+                for i in self.instructions
+            ),
             entropy=calculate_entropy(self.bytecode),
-            avg_gas=round(mean(gas_values), 2) if gas_values else 0.0,
+            avg_gas=round(gas_total / gas_count, 2) if gas_count else 0.0,
             runtime_likely=runtime,
             creation_likely=creation,
             code_kind=code_kind,
             runtime_score=runtime_score,
             creation_score=creation_score,
-            estimated_static_gas=sum(gas_values),
+            estimated_static_gas=gas_total,
             warning_count=len(self.warnings),
             sha256=hashlib.sha256(self.bytecode).hexdigest(),
             category_counts=dict(sorted(Counter(i.category for i in self.instructions).items())),
         )
+        return self._summary
 
     def opcode_counter(self) -> Counter:
         return Counter(i.opcode for i in self.instructions)
@@ -974,6 +1097,16 @@ class Formatter:
                 f"{extra_str}"
             )
 
+    def _visible_instructions(
+        self, filter_category: Optional[str], search_hex: Optional[str]
+    ) -> Iterator[Instruction]:
+        for ins in self.instructions:
+            if filter_category is not None and ins.category != filter_category:
+                continue
+            if search_hex is not None and search_hex not in ins.raw:
+                continue
+            yield ins
+
     def text_output(
         self,
         show_summary: bool,
@@ -984,12 +1117,8 @@ class Formatter:
         search_hex: Optional[str] = None,
     ) -> str:
         lines = []
-        for ins in self.instructions if show_instructions else ():
-            if filter_category and ins.category != filter_category:
-                continue
-            if search_hex and search_hex.lower() not in ins.raw.lower():
-                continue
-            lines.append(self.format_instruction(ins))
+        if show_instructions:
+            lines.extend(self.format_instruction(ins) for ins in self._visible_instructions(filter_category, search_hex))
 
         if self.metadata.stripped:
             lines.append("")
@@ -1068,14 +1197,22 @@ class Formatter:
             lines.append(f"  [{w.code}] {location}: {w.message}")
         return lines
 
-    def json_output(self, include_cfg: bool = False) -> str:
+    def json_output(
+        self,
+        include_cfg: bool = False,
+        include_instructions: bool = True,
+        filter_category: Optional[str] = None,
+        search_hex: Optional[str] = None,
+    ) -> str:
         s = self.analyzer.summary()
         payload: Dict[str, Any] = {
             "version": VERSION,
             "metadata": asdict(self.metadata),
             "summary": asdict(s),
             "warnings": [asdict(w) for w in self.analyzer.warnings],
-            "instructions": [asdict(i) for i in self.instructions],
+            "instructions": [
+                asdict(i) for i in self._visible_instructions(filter_category, search_hex)
+            ] if include_instructions else [],
         }
         if include_cfg:
             payload["cfg_edges"] = [asdict(e) for e in self.analyzer.edges]
@@ -1188,7 +1325,7 @@ def main() -> int:
             args.search = search
 
         # 1. Load bytecode
-        if args.bytecode:
+        if args.bytecode is not None:
             bytecode, metadata = normalize_bytecode(args.bytecode, remove_metadata=not args.no_metadata)
         elif args.file:
             bytecode, metadata = load_from_file(args.file, remove_metadata=not args.no_metadata)
@@ -1224,10 +1361,18 @@ def main() -> int:
         # 4. Handle special --detect-creation
         if args.detect_creation:
             summary = analyzer.summary()
-            print(
+            text = (
                 f"Code classification: {summary.code_kind} "
                 f"(runtime_score={summary.runtime_score}, creation_score={summary.creation_score})"
             )
+            if args.output is not None:
+                try:
+                    atomic_write_text(args.output, text + "\n")
+                except OSError as exc:
+                    LOG.error("Failed writing %s: %s", args.output, exc)
+                    return EXIT_WRITE_ERROR
+            else:
+                print(text)
             return EXIT_SUCCESS
 
         # 5. Format output
@@ -1242,7 +1387,12 @@ def main() -> int:
         )
 
         if args.json:
-            text = formatter.json_output(include_cfg=args.cfg)
+            text = formatter.json_output(
+                include_cfg=args.cfg,
+                include_instructions=not args.summary_only,
+                filter_category=args.category,
+                search_hex=args.search,
+            )
         else:
             text = formatter.text_output(
                 show_summary=args.summary or args.summary_only,
@@ -1253,8 +1403,12 @@ def main() -> int:
                 search_hex=args.search,
             )
 
-        if args.output:
-            atomic_write_text(args.output, text + ("\n" if text else ""))
+        if args.output is not None:
+            try:
+                atomic_write_text(args.output, text + ("\n" if text else ""))
+            except OSError as exc:
+                LOG.error("Failed writing %s: %s", args.output, exc)
+                return EXIT_WRITE_ERROR
             LOG.info("Saved output to %s", args.output)
         else:
             print(text)
@@ -1264,15 +1418,15 @@ def main() -> int:
     except ValueError as e:
         LOG.error("Invalid bytecode: %s", e)
         return EXIT_INVALID_BYTECODE
-    except IOError as e:
-        LOG.error("%s", e)
-        return EXIT_READ_ERROR
-    except RuntimeError as e:
-        LOG.error("%s", e)
-        return EXIT_DISASSEMBLY_ERROR
     except BrokenPipeError:
         # Typical when piping into `head`; avoid a noisy traceback.
         return EXIT_SUCCESS
+    except OSError as exc:
+        LOG.error("%s", exc)
+        return EXIT_READ_ERROR
+    except RuntimeError as exc:
+        LOG.error("%s", exc)
+        return EXIT_DISASSEMBLY_ERROR
     except KeyboardInterrupt:
         print("\nInterrupted", file=sys.stderr)
         return 130
